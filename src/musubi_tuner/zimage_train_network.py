@@ -141,7 +141,7 @@ class ZImageNetworkTrainer(NetworkTrainer):
 
         # Get embeddings
         # They are [1, Seq, Dim]
-        embed = sample_parameter["cap_feats"].to(device=device, dtype=torch.bfloat16)
+        embed = sample_parameter["cap_feats"].to(device=device, dtype=model.dtype)
         mask = sample_parameter["cap_mask"].to(device=device, dtype=torch.bool)
 
         do_cfg = guidance_scale > 1.0
