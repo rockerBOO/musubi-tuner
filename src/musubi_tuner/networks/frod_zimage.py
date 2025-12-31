@@ -75,25 +75,14 @@ def create_arch_network(
 
 def create_arch_network_from_weights(
     multiplier: float,
-    weights_sd: dict[str, torch.Tensor],
-    text_encoders: List[nn.Module] | None = None,
-    unet: nn.Module | None = None,
+    weights_sd: Dict[str, torch.Tensor],
+    text_encoders: Optional[List[nn.Module]] = None,
+    unet: Optional[nn.Module] = None,
     for_inference: bool = False,
     **kwargs,
 ) -> frod.FRoDNetwork:
     """
     Create FRoD network for Z-Image from saved weights.
-
-    Args:
-        multiplier: Output scaling factor
-        weights_sd: State dict with FRoD weights
-        text_encoders: Text encoder modules
-        unet: U-Net/DiT module
-        for_inference: Whether to use inference-optimized module
-        **kwargs: Additional arguments
-
-    Returns:
-        FRoDNetwork instance with loaded weights
     """
     return frod.create_network_from_weights(
         ZIMAGE_TARGET_REPLACE_MODULES,
@@ -104,84 +93,3 @@ def create_arch_network_from_weights(
         for_inference,
         **kwargs,
     )
-
-
-def convert_frod_to_lora(
-    frod_weights_path: str,
-    output_path: str,
-    rank: int = 64,
-    dtype: torch.dtype = torch.float16,
-) -> None:
-    """
-    Utility function to convert saved FRoD weights to LoRA format.
-
-    Args:
-        frod_weights_path: Path to saved FRoD weights (.safetensors or .pt)
-        output_path: Output path for LoRA weights
-        rank: Target LoRA rank
-        dtype: Data type for output weights
-    """
-    import os
-
-    # Load FRoD weights
-    if frod_weights_path.endswith(".safetensors"):
-        from safetensors.torch import load_file
-
-        frod_sd = load_file(frod_weights_path)
-    else:
-        frod_sd = torch.load(frod_weights_path, map_location="cpu")
-
-    # Group weights by module
-    modules = {}
-    for key, value in frod_sd.items():
-        parts = key.split(".")
-        module_name = parts[0]
-        param_name = ".".join(parts[1:])
-
-        if module_name not in modules:
-            modules[module_name] = {}
-        modules[module_name][param_name] = value
-
-    # Convert each module
-    lora_sd = {}
-
-    for module_name, params in modules.items():
-        if "sigma" not in params or "S_values" not in params:
-            continue
-
-        sigma = params["sigma"]
-        S_values = params["S_values"]
-        U = params.get("U", torch.eye(S_values.shape[0]))
-        V = params.get("V", torch.eye(S_values.shape[0]))
-        sparse_mask = params.get("sparse_mask", torch.ones_like(S_values))
-        original_weight = params.get("original_weight", torch.zeros(U.shape[0], V.shape[0]))
-
-        # Compute delta weight
-        S = S_values * sparse_mask
-        Sigma = torch.diag(sigma)
-        merged_weight = U @ (Sigma + S) @ V.T
-        delta_w = merged_weight - original_weight
-
-        # SVD decomposition
-        U_svd, S_svd, Vh = torch.linalg.svd(delta_w.float(), full_matrices=False)
-
-        # Truncate to rank
-        r = min(rank, len(S_svd))
-        S_sqrt = torch.sqrt(S_svd[:r])
-
-        lora_down = S_sqrt.unsqueeze(1) * Vh[:r, :]
-        lora_up = U_svd[:, :r] * S_sqrt.unsqueeze(0)
-
-        lora_sd[f"{module_name}.lora_down.weight"] = lora_down.to(dtype)
-        lora_sd[f"{module_name}.lora_up.weight"] = lora_up.to(dtype)
-        lora_sd[f"{module_name}.alpha"] = torch.tensor(float(r))
-
-    # Save
-    if output_path.endswith(".safetensors"):
-        from safetensors.torch import save_file
-
-        save_file(lora_sd, output_path, {"converted_from": "frod", "rank": str(rank)})
-    else:
-        torch.save(lora_sd, output_path)
-
-    logger.info(f"Converted FRoD to LoRA (rank={rank}): {output_path}")

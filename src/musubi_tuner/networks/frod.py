@@ -15,6 +15,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tqdm import tqdm
+
 import logging
 
 logger = logging.getLogger(__name__)
@@ -84,8 +86,10 @@ class FRoDModule(torch.nn.Module):
         self.register_buffer("alpha", torch.tensor(alpha))
 
         # These will be set by set_shared_basis() after hierarchical decomposition
-        self.register_buffer("V", V if V is not None else torch.eye(in_dim))
         self.register_buffer("U", torch.eye(out_dim, in_dim))
+
+        self._V_key: Optional[str] = None
+        self.network: Optional["FRoDNetwork"] = None
 
         # Create or use provided sparse mask
         if sparse_mask is not None:
@@ -105,6 +109,13 @@ class FRoDModule(torch.nn.Module):
         self.module_dropout = module_dropout
 
         self.org_module = org_module  # Will be removed in apply_to()
+
+    @property
+    def V(self) -> torch.Tensor:
+        """Get shared V from network."""
+        if self._network_ref is None or self._V_key is None:
+            raise RuntimeError(f"FRoD module {self.frod_name} not initialized - call set_network() first")
+        return self._network_ref.shared_V[self._V_key]
 
     def _create_sparse_mask(self, n: int, sparsity: float) -> torch.Tensor:
         """Create random off-diagonal sparse mask."""
@@ -179,6 +190,14 @@ class FRoDModule(torch.nn.Module):
         Sigma = torch.diag(self.sigma)
         weight = self.U @ (Sigma + S) @ self.V.T
         return weight
+
+    def set_network(self, network: "FRoDNetwork"):
+        """Set reference to parent network for accessing shared V."""
+        self.network = network
+
+    def set_category(self, category: str):
+        """Set category key for shared V lookup."""
+        self._V_key = category
 
     def apply_to(self):
         """Replace the original module's forward with this module's forward."""
@@ -279,8 +298,6 @@ class FRoDInfModule(FRoDModule):
         self.network: "FRoDNetwork" = None
         self._cached_weight: Optional[torch.Tensor] = None
 
-    def set_network(self, network: "FRoDNetwork"):
-        self.network = network
 
     def cache_weights(self):
         """Pre-compute merged weights for fast inference."""
@@ -441,6 +458,21 @@ class FRoDNetwork(torch.nn.Module):
                 "to_k",
                 "to_v",
                 "to_out",
+                "img_attn_q",
+                "img_attn_k",
+                "img_attn_v",
+                "img_attn_proj",
+                "txt_attn_q",
+                "txt_attn_k",
+                "txt_attn_v",
+                "txt_attn_proj",
+                "img_mlp_0",
+                "img_mlp_2",
+                "txt_mlp_0",
+                "txt_mlp_2",
+                "linear1",
+                "linear2",
+                "to_out_linear",
             ]:
                 return part
         # Fallback to last part
@@ -457,6 +489,8 @@ class FRoDNetwork(torch.nn.Module):
         frods = []
         skipped = []
 
+        # First, collect all candidate modules
+        candidates = []
         for name, module in root_module.named_modules():
             if target_replace_mods is None or module.__class__.__name__ in target_replace_mods:
                 if target_replace_mods is None:
@@ -474,32 +508,37 @@ class FRoDNetwork(torch.nn.Module):
                     included = any(p.match(original_name) for p in self.include_re_patterns)
 
                     if excluded and not included:
-                        if self.verbose:
-                            logger.info(f"Excluded: {original_name}")
+                        skipped.append(original_name)
                         continue
 
-                    # Get category for shared basis
-                    category = self._get_category(original_name)
-
-                    frod = module_class(
-                        frod_name,
-                        child_module,
-                        multiplier=self.multiplier,
-                        sparse_rate=self.sparse_rate,
-                        alpha=self.alpha,
-                        dropout=self.dropout,
-                        rank_dropout=self.rank_dropout,
-                        module_dropout=self.module_dropout,
-                    )
-
-                    frods.append(frod)
-                    self.modules_by_category[category].append(frod)
-
-                    if self.verbose:
-                        logger.info(f"\t{frod_name} (category: {category})")
+                    candidates.append((original_name, frod_name, child_module))
 
                 if target_replace_mods is None:
                     break
+
+        # Create modules with progress bar
+        logger.info(f"Creating {len(candidates)} FRoD modules...")
+        for original_name, frod_name, child_module in tqdm(candidates, desc="Creating FRoD modules", disable=not self.verbose):
+            # Get category for shared basis
+            category = self._get_category(original_name)
+
+            frod = module_class(
+                frod_name,
+                child_module,
+                multiplier=self.multiplier,
+                sparse_rate=self.sparse_rate,
+                alpha=self.alpha,
+                dropout=self.dropout,
+                rank_dropout=self.rank_dropout,
+                module_dropout=self.module_dropout,
+            )
+            frod.set_network(self)
+
+            frods.append(frod)
+            self.modules_by_category[category].append(frod)
+
+            if self.verbose:
+                logger.debug(f"\t{frod_name} (category: {category})")
 
         return frods, skipped
 
@@ -509,275 +548,364 @@ class FRoDNetwork(torch.nn.Module):
         Should be called after all modules are created but before training.
         """
         logger.info("Computing shared bases via Hierarchical Joint Decomposition...")
-
-        for category, modules in self.modules_by_category.items():
+        categories = list(self.modules_by_category.keys())
+        
+        for category in tqdm(categories, desc="Computing shared bases"):
+            modules = self.modules_by_category[category]
             if not modules:
                 continue
-
-            logger.info(f"  Category '{category}': {len(modules)} modules")
-
+            
             # Collect weights
-            weights = [m.original_weight.data for m in modules]
-
+            weights = [m.original_weight for m in modules]
+            
             # Check dimensions match
             in_dims = [w.shape[1] for w in weights]
             if len(set(in_dims)) > 1:
                 logger.warning(f"  Dimension mismatch in category '{category}', skipping shared basis")
+                # Initialize each module independently (fallback)
+                for m in modules:
+                    m._network_ref = self
+                    m._V_key = None  # Will use fallback identity matrix
+                    m.initialize_from_weight()
                 continue
-
+            
             # Compute shared basis
             V = self._compute_shared_basis(weights, self.regularization_alpha)
-            self.shared_V[category] = V
-
+            
+            # Register as buffer so it's saved/loaded with state_dict
+            buffer_name = f'shared_V_{category.replace(".", "_")}'  # sanitize name for module registration
+            self.register_buffer(buffer_name, V)
+            self.shared_V[category] = getattr(self, buffer_name)
+            
             # Create shared sparse mask
             n = V.shape[0]
             mask = self._create_sparse_mask(n, self.sparse_rate)
-            self.shared_masks[category] = mask
+            mask_buffer_name = f'shared_mask_{category.replace(".", "_")}'
+            self.register_buffer(mask_buffer_name, mask)
+            self.shared_masks[category] = getattr(self, mask_buffer_name)
+            
+            # Set network reference and category key for all modules
+            for m in tqdm(
+                modules,
+                desc=f"  Initializing '{category}'",
+                leave=False,
+                disable=len(modules) < 10,
+            ):
+                m._network_ref = self
+                m._V_key = category
+                m.initialize_from_weight()  # Now computes U and init_sigma using shared V
+        
+        logger.info(f"Shared bases computed for {len(categories)} categories")
+        def _compute_shared_basis(self, weights: List[torch.Tensor], pi: float) -> torch.Tensor:
+            """Compute shared basis V using Hierarchical Joint Decomposition."""
+            A_list = [w.detach().cpu().numpy() for w in weights]
+            A_stack = np.vstack(A_list)
 
-            # Apply to all modules in category
-            for m in modules:
-                m.set_shared_basis(V.clone(), mask.clone())
+            Q, R_global = qr(A_stack)
 
-        logger.info("Shared bases computed and applied")
+            Q_list = []
+            row_idx = 0
+            for A in A_list:
+                m = A.shape[0]
+                Q_list.append(Q[row_idx : row_idx + m, :])
+                row_idx += m
 
-    def _compute_shared_basis(self, weights: List[torch.Tensor], pi: float) -> torch.Tensor:
-        """Compute shared basis V using Hierarchical Joint Decomposition."""
-        A_list = [w.detach().cpu().numpy() for w in weights]
-        A_stack = np.vstack(A_list)
+            n = R_global.shape[1]
+            T_pi = np.zeros((n, n), dtype=R_global.dtype)
 
-        Q, R_global = qr(A_stack)
+            for Qi in Q_list:
+                Qi_term = Qi.T @ Qi + pi * np.eye(n)
+                T_pi += np.linalg.inv(Qi_term)
+            T_pi /= len(Q_list)
 
-        Q_list = []
-        row_idx = 0
-        for A in A_list:
-            m = A.shape[0]
-            Q_list.append(Q[row_idx : row_idx + m, :])
-            row_idx += m
+            _, Z = np.linalg.eigh(T_pi)
+            V = R_global.T @ Z
 
-        n = R_global.shape[1]
-        T_pi = np.zeros((n, n), dtype=R_global.dtype)
+            return torch.from_numpy(V).float()
 
-        for Qi in Q_list:
-            Qi_term = Qi.T @ Qi + pi * np.eye(n)
-            T_pi += np.linalg.inv(Qi_term)
-        T_pi /= len(Q_list)
+        def _create_sparse_mask(self, n: int, sparsity: float) -> torch.Tensor:
+            """Create random off-diagonal sparse mask."""
+            rows, cols = torch.meshgrid(torch.arange(n), torch.arange(n), indexing="ij")
+            mask_indices = torch.stack([rows.flatten(), cols.flatten()], dim=1)
+            off_diag = mask_indices[mask_indices[:, 0] != mask_indices[:, 1]]
 
-        _, Z = np.linalg.eigh(T_pi)
-        V = R_global.T @ Z
+            k = min(int(n * n * sparsity), off_diag.shape[0])
+            if k > 0:
+                perm = torch.randperm(off_diag.shape[0])[:k]
+                selected = off_diag[perm]
+                mask = torch.zeros(n, n)
+                mask[selected[:, 0], selected[:, 1]] = 1.0
+            else:
+                mask = torch.zeros(n, n)
 
-        return torch.from_numpy(V).float()
+            return mask
 
-    def _create_sparse_mask(self, n: int, sparsity: float) -> torch.Tensor:
-        """Create random off-diagonal sparse mask."""
-        rows, cols = torch.meshgrid(torch.arange(n), torch.arange(n), indexing="ij")
-        mask_indices = torch.stack([rows.flatten(), cols.flatten()], dim=1)
-        off_diag = mask_indices[mask_indices[:, 0] != mask_indices[:, 1]]
+        def prepare_network(self, args=None):
+            """Called after network creation, compute shared bases here."""
+            self.compute_shared_bases()
 
-        k = min(int(n * n * sparsity), off_diag.shape[0])
-        if k > 0:
-            perm = torch.randperm(off_diag.shape[0])[:k]
-            selected = off_diag[perm]
-            mask = torch.zeros(n, n)
-            mask[selected[:, 0], selected[:, 1]] = 1.0
-        else:
-            mask = torch.zeros(n, n)
+        def set_multiplier(self, multiplier: float):
+            self.multiplier = multiplier
+            for frod in self.text_encoder_frods + self.unet_frods:
+                frod.multiplier = multiplier
 
-        return mask
+        def set_enabled(self, is_enabled: bool):
+            for frod in self.text_encoder_frods + self.unet_frods:
+                if hasattr(frod, "enabled"):
+                    frod.enabled = is_enabled
 
-    def prepare_network(self, args):
-        """Called after network creation, compute shared bases here."""
-        self.compute_shared_bases()
+        def load_weights(self, file: str):
+            if os.path.splitext(file)[1] == ".safetensors":
+                from safetensors.torch import load_file
 
-    def set_multiplier(self, multiplier: float):
-        self.multiplier = multiplier
-        for frod in self.text_encoder_frods + self.unet_frods:
-            frod.multiplier = multiplier
+                weights_sd = load_file(file)
+            else:
+                weights_sd = torch.load(file, map_location="cpu")
 
-    def set_enabled(self, is_enabled: bool):
-        for frod in self.text_encoder_frods + self.unet_frods:
-            if hasattr(frod, "enabled"):
-                frod.enabled = is_enabled
+            info = self.load_state_dict(weights_sd, strict=False)
+            return info
 
-    def load_weights(self, file: str):
-        if os.path.splitext(file)[1] == ".safetensors":
-            from safetensors.torch import load_file
+        def apply_to(
+            self,
+            text_encoders: Optional[nn.Module],
+            unet: Optional[nn.Module],
+            apply_text_encoder: bool = True,
+            apply_unet: bool = True,
+        ):
+            if not apply_text_encoder:
+                self.text_encoder_frods = []
+            if not apply_unet:
+                self.unet_frods = []
 
-            weights_sd = load_file(file)
-        else:
-            weights_sd = torch.load(file, map_location="cpu")
+            if not self.text_encoder_frods and not self.unet_frods:
+                raise RuntimeError("No FRoD modules found")
 
-        info = self.load_state_dict(weights_sd, strict=False)
-        return info
+            logger.info(f"Applying FRoD to model...")
 
-    def apply_to(
-        self,
-        text_encoders: Optional[nn.Module],
-        unet: Optional[nn.Module],
-        apply_text_encoder: bool = True,
-        apply_unet: bool = True,
-    ):
-        if not apply_text_encoder:
-            self.text_encoder_frods = []
-        if not apply_unet:
-            self.unet_frods = []
+            all_frods = self.text_encoder_frods + self.unet_frods
+            for frod in tqdm(all_frods, desc="Applying FRoD modules"):
+                frod.apply_to()
+                self.add_module(frod.frod_name, frod)
 
-        if not self.text_encoder_frods and not self.unet_frods:
-            raise RuntimeError("No FRoD modules found")
+            logger.info(f"Applied {len(all_frods)} FRoD modules")
 
-        logger.info(f"Applying FRoD: {len(self.unet_frods)} U-Net modules")
+        def is_mergeable(self) -> bool:
+            return True
 
-        for frod in self.text_encoder_frods + self.unet_frods:
-            frod.apply_to()
-            self.add_module(frod.frod_name, frod)
+        def merge_to(self, text_encoders, unet, weights_sd, dtype=None, device=None, non_blocking=False):
+            """Merge FRoD weights into the base model."""
+            from concurrent.futures import ThreadPoolExecutor
 
-    def is_mergeable(self) -> bool:
-        return True
+            all_frods = self.text_encoder_frods + self.unet_frods
 
-    def prepare_optimizer_params(self, unet_lr: float = 1e-4, **kwargs):
-        """
-        Prepare optimizer parameters with separate learning rates for sigma and S.
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = []
+                for frod in tqdm(all_frods, desc="Merging FRoD weights"):
+                    sd_for_frod = {}
+                    for key in weights_sd.keys():
+                        if key.startswith(frod.frod_name):
+                            sd_for_frod[key[len(frod.frod_name) + 1 :]] = weights_sd[key]
 
-        FRoD paper recommends higher LR for sigma (on-axis) than S (off-axis).
-        """
-        self.requires_grad_(True)
+                    if len(sd_for_frod) == 0:
+                        logger.info(f"No weight for {frod.frod_name}")
+                        continue
 
-        # Get learning rate ratio (default: sigma gets 10x the LR of S)
-        sigma_lr_ratio = kwargs.get("sigma_lr_ratio", 10.0)
-        s_lr = unet_lr
-        sigma_lr = unet_lr * sigma_lr_ratio
+                    futures.append(executor.submit(frod.merge_to, sd_for_frod, dtype, device, non_blocking))
 
-        all_params = []
-        lr_descriptions = []
+                for future in futures:
+                    future.result()
 
-        sigma_params = []
-        s_params = []
+            logger.info("FRoD weights merged")
 
-        for frod in self.unet_frods:
-            sigma_params.append(frod.sigma)
-            s_params.append(frod.S_values)
+        def prepare_optimizer_params(self, unet_lr: float = 1e-4, **kwargs):
+            """
+            Prepare optimizer parameters with separate learning rates for sigma and S.
 
-        if sigma_params:
-            all_params.append({"params": sigma_params, "lr": sigma_lr})
-            lr_descriptions.append(f"sigma (lr={sigma_lr})")
+            FRoD paper recommends higher LR for sigma (on-axis) than S (off-axis).
+            """
+            self.requires_grad_(True)
 
-        if s_params:
-            all_params.append({"params": s_params, "lr": s_lr})
-            lr_descriptions.append(f"S_values (lr={s_lr})")
+            # Get learning rate ratio (default: sigma gets 10x the LR of S)
+            sigma_lr_ratio = kwargs.get("sigma_lr_ratio", 10.0)
+            s_lr = unet_lr
+            sigma_lr = unet_lr * sigma_lr_ratio
 
-        return all_params, lr_descriptions
+            all_params = []
+            lr_descriptions = []
 
-    def get_trainable_params(self):
-        return self.parameters()
+            sigma_params = []
+            s_params = []
 
-    def save_weights(self, file: str, dtype, metadata: Optional[Dict] = None):
-        if metadata is not None and len(metadata) == 0:
-            metadata = None
+            for frod in self.unet_frods:
+                sigma_params.append(frod.sigma)
+                s_params.append(frod.S_values)
 
-        state_dict = self.state_dict()
+            if sigma_params:
+                all_params.append({"params": sigma_params, "lr": sigma_lr})
+                lr_descriptions.append(f"sigma (lr={sigma_lr})")
 
-        if dtype is not None:
-            for key in list(state_dict.keys()):
-                v = state_dict[key]
-                v = v.detach().clone().to("cpu").to(dtype)
-                state_dict[key] = v
+            if s_params:
+                all_params.append({"params": s_params, "lr": s_lr})
+                lr_descriptions.append(f"S_values (lr={s_lr})")
 
-        if os.path.splitext(file)[1] == ".safetensors":
-            from safetensors.torch import save_file
+            return all_params, lr_descriptions
 
-            if metadata is None:
-                metadata = {}
-            metadata["frod_format"] = "true"
-            save_file(state_dict, file, metadata)
-        else:
-            torch.save(state_dict, file)
+        def get_trainable_params(self):
+            return self.parameters()
 
-    def convert_to_lora(
-        self,
-        rank: int = 64,
-        clamp_quantile: float = 0.99,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Convert all FRoD modules to LoRA format.
+        def save_weights(self, file: str, dtype, metadata: Optional[Dict] = None):
+            if metadata is not None and len(metadata) == 0:
+                metadata = None
 
-        Args:
-            rank: Target LoRA rank
-            clamp_quantile: Clamp extreme values before SVD
+            state_dict = self.state_dict()
 
-        Returns:
-            State dict in LoRA format
-        """
-        lora_state_dict = {}
+            if dtype is not None:
+                logger.info(f"Converting weights to {dtype}...")
+                for key in tqdm(list(state_dict.keys()), desc="Converting dtype"):
+                    v = state_dict[key]
+                    v = v.detach().clone().to("cpu").to(dtype)
+                    state_dict[key] = v
 
-        logger.info(f"Converting FRoD to LoRA (rank={rank})...")
-        total_error = 0
+            if os.path.splitext(file)[1] == ".safetensors":
+                from safetensors.torch import save_file
 
-        for frod in self.text_encoder_frods + self.unet_frods:
-            lora_data = frod.to_lora(rank=rank, clamp_quantile=clamp_quantile)
+                if metadata is None:
+                    metadata = {}
+                metadata["frod_format"] = "true"
+                metadata["sparse_rate"] = str(self.sparse_rate)
+                metadata["alpha"] = str(self.alpha)
+                save_file(state_dict, file, metadata)
+            else:
+                torch.save(state_dict, file)
 
-            # Use same naming convention as LoRA
-            lora_name = frod.frod_name
-            lora_state_dict[f"{lora_name}.lora_down.weight"] = lora_data["lora_down.weight"]
-            lora_state_dict[f"{lora_name}.lora_up.weight"] = lora_data["lora_up.weight"]
-            lora_state_dict[f"{lora_name}.alpha"] = lora_data["alpha"]
+            logger.info(f"Saved FRoD weights to: {file}")
 
-            total_error += lora_data["reconstruction_error"]
+        def convert_to_lora(
+            self,
+            rank: int = 64,
+            clamp_quantile: float = 0.99,
+        ) -> Dict[str, torch.Tensor]:
+            """
+            Convert all FRoD modules to LoRA format.
 
-            if self.verbose:
-                logger.info(f"  {lora_name}: error={lora_data['reconstruction_error']:.4f}")
+            Args:
+                rank: Target LoRA rank
+                clamp_quantile: Clamp extreme values before SVD
 
-        avg_error = total_error / max(len(self.text_encoder_frods + self.unet_frods), 1)
-        logger.info(f"Conversion complete. Average reconstruction error: {avg_error:.4f}")
+            Returns:
+                State dict in LoRA format
+            """
+            lora_state_dict = {}
 
-        return lora_state_dict
+            logger.info(f"Converting FRoD to LoRA (rank={rank})...")
 
-    def save_as_lora(
-        self,
-        file: str,
-        rank: int = 64,
-        dtype=None,
-        metadata: Optional[Dict] = None,
-        clamp_quantile: float = 0.99,
-    ):
-        """
-        Save FRoD weights in LoRA-compatible format.
+            all_frods = self.text_encoder_frods + self.unet_frods
+            total_error = 0
 
-        Args:
-            file: Output file path
-            rank: Target LoRA rank
-            dtype: Data type for saved weights
-            metadata: Optional metadata dict
-            clamp_quantile: Clamp extreme values before SVD
-        """
-        lora_state_dict = self.convert_to_lora(rank=rank, clamp_quantile=clamp_quantile)
+            for frod in tqdm(all_frods, desc="Converting to LoRA"):
+                lora_data = frod.to_lora(rank=rank, clamp_quantile=clamp_quantile)
 
-        if dtype is not None:
-            for key in lora_state_dict:
-                lora_state_dict[key] = lora_state_dict[key].to(dtype)
+                # Use same naming convention as LoRA
+                lora_name = frod.frod_name
+                lora_state_dict[f"{lora_name}.lora_down.weight"] = lora_data["lora_down.weight"]
+                lora_state_dict[f"{lora_name}.lora_up.weight"] = lora_data["lora_up.weight"]
+                lora_state_dict[f"{lora_name}.alpha"] = lora_data["alpha"]
 
-        if os.path.splitext(file)[1] == ".safetensors":
-            from safetensors.torch import save_file
+                total_error += lora_data["reconstruction_error"]
 
-            if metadata is None:
-                metadata = {}
-            metadata["lora_converted_from_frod"] = "true"
-            metadata["frod_to_lora_rank"] = str(rank)
-            save_file(lora_state_dict, file, metadata)
-        else:
-            torch.save(lora_state_dict, file)
+            avg_error = total_error / max(len(all_frods), 1)
+            logger.info(f"Conversion complete. Average reconstruction error: {avg_error:.4f}")
 
-        logger.info(f"Saved LoRA weights to: {file}")
+            return lora_state_dict
 
-    def enable_gradient_checkpointing(self):
-        pass
+        def save_as_lora(
+            self,
+            file: str,
+            rank: int = 64,
+            dtype=None,
+            metadata: Optional[Dict] = None,
+            clamp_quantile: float = 0.99,
+        ):
+            """
+            Save FRoD weights in LoRA-compatible format.
 
-    def prepare_grad_etc(self, unet):
-        self.requires_grad_(True)
+            Args:
+                file: Output file path
+                rank: Target LoRA rank
+                dtype: Data type for saved weights
+                metadata: Optional metadata dict
+                clamp_quantile: Clamp extreme values before SVD
+            """
+            lora_state_dict = self.convert_to_lora(rank=rank, clamp_quantile=clamp_quantile)
 
-    def on_epoch_start(self, unet):
-        self.train()
+            if dtype is not None:
+                logger.info(f"Converting to {dtype}...")
+                for key in tqdm(list(lora_state_dict.keys()), desc="Converting dtype"):
+                    lora_state_dict[key] = lora_state_dict[key].to(dtype)
 
-    def on_step_start(self):
-        pass
+            if os.path.splitext(file)[1] == ".safetensors":
+                from safetensors.torch import save_file
+
+                if metadata is None:
+                    metadata = {}
+                metadata["lora_converted_from_frod"] = "true"
+                metadata["frod_to_lora_rank"] = str(rank)
+                save_file(lora_state_dict, file, metadata)
+            else:
+                torch.save(lora_state_dict, file)
+
+            logger.info(f"Saved LoRA weights to: {file}")
+
+        def enable_gradient_checkpointing(self):
+            pass
+
+        def prepare_grad_etc(self, unet):
+            self.requires_grad_(True)
+
+        def on_epoch_start(self, unet):
+            self.train()
+
+        def on_step_start(self):
+            pass
+
+        def backup_weights(self):
+            """Backup original weights for potential restoration."""
+            all_frods: List[FRoDInfModule] = self.text_encoder_frods + self.unet_frods
+            for frod in tqdm(all_frods, desc="Backing up weights"):
+                if hasattr(frod, "org_module_ref"):
+                    org_module = frod.org_module_ref[0]
+                    if not hasattr(org_module, "_frod_org_weight"):
+                        sd = org_module.state_dict()
+                        org_module._frod_org_weight = sd["weight"].detach().clone()
+                        org_module._frod_restored = True
+
+        def restore_weights(self):
+            """Restore original weights."""
+            all_frods: List[FRoDInfModule] = self.text_encoder_frods + self.unet_frods
+            for frod in tqdm(all_frods, desc="Restoring weights"):
+                if hasattr(frod, "org_module_ref"):
+                    org_module = frod.org_module_ref[0]
+                    if hasattr(org_module, "_frod_org_weight") and not org_module._frod_restored:
+                        sd = org_module.state_dict()
+                        sd["weight"] = org_module._frod_org_weight
+                        org_module.load_state_dict(sd)
+                        org_module._frod_restored = True
+
+        def pre_calculation(self):
+            """Pre-calculate merged weights for inference."""
+            all_frods: List[FRoDInfModule] = self.text_encoder_frods + self.unet_frods
+            for frod in tqdm(all_frods, desc="Pre-calculating weights"):
+                if hasattr(frod, "org_module_ref"):
+                    org_module = frod.org_module_ref[0]
+                    sd = org_module.state_dict()
+
+                    org_weight = sd["weight"]
+                    delta_weight = frod.get_delta_weight().to(org_weight.device, dtype=org_weight.dtype)
+                    sd["weight"] = org_weight + delta_weight * frod.multiplier * frod.scale
+                    org_module.load_state_dict(sd)
+
+                    org_module._frod_restored = False
+                    frod.enabled = False
 
 
 def create_network(
@@ -810,8 +938,8 @@ def create_network(
         module_dropout = float(module_dropout)
 
     verbose = kwargs.get("verbose", False)
-    if verbose is not None:
-        verbose = True if verbose == "True" else False
+    if isinstance(verbose, str):
+        verbose = verbose.lower() == "true"
 
     exclude_patterns = kwargs.get("exclude_patterns", None)
     if exclude_patterns is not None and isinstance(exclude_patterns, str):
@@ -856,7 +984,7 @@ def create_arch_network(
     exclude_patterns = kwargs.get("exclude_patterns", None)
     if exclude_patterns is None:
         exclude_patterns = []
-    else:
+    elif isinstance(exclude_patterns, str):
         exclude_patterns = ast.literal_eval(exclude_patterns)
 
     exclude_patterns.append(r".*(img_mod|txt_mod|modulation).*")
@@ -889,9 +1017,6 @@ def create_network_from_weights(
 
     module_class = FRoDInfModule if for_inference else FRoDModule
 
-    # Extract sparse_rate and alpha from weights if available
-    # This is a simplified version - full implementation would parse the state dict
-
     network = FRoDNetwork(
         target_replace_modules,
         "frod_unet",
@@ -899,6 +1024,7 @@ def create_network_from_weights(
         unet,
         multiplier=multiplier,
         module_class=module_class,
+        **kwargs,
     )
 
     return network
