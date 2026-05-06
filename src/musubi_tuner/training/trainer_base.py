@@ -1290,6 +1290,65 @@ class NetworkTrainer:
         """
         return {}
 
+    def on_train_start(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network,
+        transformer,
+        optimizer,
+    ) -> None:
+        """Called once after accelerator.prepare and before the training loop starts.
+
+        Use this for initializing extension state that depends on prepared models
+        (EMA copies, decay schedulers, register_forward_hook on the transformer, etc.).
+        """
+
+    def on_post_optimizer_step(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network,
+        sync_gradients: bool,
+        global_step: int,
+    ) -> None:
+        """Called after optimizer.step / lr_scheduler.step / zero_grad each inner step.
+
+        ``sync_gradients`` mirrors ``accelerator.sync_gradients`` and is True only
+        on steps where an actual optimizer update occurred (gradient accumulation aware).
+        Use for EMA updates or any post-step bookkeeping.
+        """
+
+    def on_sample_images(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network,
+        sample_fn,
+    ) -> None:
+        """Around-hook wrapping ``self.sample_images(...)`` calls.
+
+        Default implementation simply invokes ``sample_fn()``. Override to e.g.
+        temporarily swap student weights for EMA (teacher) weights before sampling
+        and restore them afterwards.
+        """
+        sample_fn()
+
+    def on_post_save(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network,
+        ckpt_name: str,
+        save_dtype,
+        metadata: dict,
+    ) -> None:
+        """Called after the main network checkpoint has been saved.
+
+        ``ckpt_name`` is the basename written to ``args.output_dir``. Use this hook
+        to write companion files (EMA weights, projection heads, etc.) alongside.
+        """
+
     # endregion extension seams
 
     def train(self, args):
