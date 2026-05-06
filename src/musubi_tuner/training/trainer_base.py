@@ -1349,6 +1349,39 @@ class NetworkTrainer:
         to write companion files (EMA weights, projection heads, etc.) alongside.
         """
 
+    def extra_trainable_params(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network,
+        transformer,
+        trainable_params: list,
+    ) -> list:
+        """Optionally augment the param-group list passed to the optimizer.
+
+        Default: pass-through. Override to merge extra modules' parameters
+        (e.g. a representation projection head) into ``trainable_params``.
+        Subclasses are expected to stash any owned modules on ``self`` so
+        ``on_train_start`` and later hooks can use them.
+        """
+        return trainable_params
+
+    def extra_metadata(self, args: argparse.Namespace) -> dict:
+        """Returns extra ``ss_*`` metadata keys to embed in saved safetensors.
+
+        Default: empty dict. Override to add extension-specific metadata.
+        """
+        return {}
+
+    def extra_step_logs(self, args: argparse.Namespace, logs: dict) -> dict:
+        """Returns additional log entries to merge into the per-step log payload.
+
+        Called just before ``accelerator.log`` on logging steps. The returned
+        dict is merged into ``logs`` (existing keys are overwritten on collision).
+        Default: empty dict.
+        """
+        return {}
+
     # endregion extension seams
 
     def train(self, args):
