@@ -1327,11 +1327,14 @@ class NetworkTrainer:
         ckpt_name: str,
         save_dtype,
         metadata: dict,
+        force_sync_upload: bool,
     ) -> None:
         """Called after the main network checkpoint has been saved.
 
         ``ckpt_name`` is the basename written to ``args.output_dir``. Use this hook
         to write companion files (EMA weights, projection heads, etc.) alongside.
+        ``force_sync_upload`` mirrors the flag passed to the main HuggingFace upload
+        so subclasses uploading companion files can match the same behaviour.
         """
 
     def on_before_sample_images(self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype) -> None:
