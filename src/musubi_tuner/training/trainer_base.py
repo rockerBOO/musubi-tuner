@@ -799,7 +799,7 @@ class NetworkTrainer:
                 line += "#" * int(w / max_weighting * CONSOLE_WIDTH)
                 print(line)
 
-    def sample_images(self, accelerator: Accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype):
+    def sample_images(self, accelerator: Accelerator, args, epoch, steps, vae, transformer, sample_parameters, dit_dtype):
         """architecture independent sample images"""
         if not should_sample_images(args, steps, epoch):
             return
@@ -809,8 +809,6 @@ class NetworkTrainer:
         if sample_parameters is None:
             logger.error(f"No prompt file / プロンプトファイルがありません: {args.sample_prompts}")
             return
-
-        self.on_before_sample_images(accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype)
 
         distributed_state = PartialState()  # for multi gpu distributed inference. this is a singleton, so it's safe to use it here
 
@@ -859,8 +857,6 @@ class NetworkTrainer:
 
         transformer.switch_block_swap_for_training()
         clean_memory_on_device(accelerator.device)
-
-        self.on_after_sample_images(accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype)
 
     def sample_image_inference(self, accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps):
         """architecture independent sample images"""
@@ -1354,7 +1350,6 @@ class NetworkTrainer:
         based on the generated samples.
         """
         pass
-
 
     def extra_trainable_params(
         self,
