@@ -1229,7 +1229,9 @@ class NetworkTrainer:
         so subclasses uploading companion files can match the same behaviour.
         """
 
-    def on_before_sample_images(self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype) -> None:
+    def on_before_sample_images(
+        self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype
+    ) -> None:
         """Called just before sample image generation begins, while the transformer is still in training mode.
 
         The transformer is still wrapped by the accelerator at this point. Use this hook for
@@ -1237,7 +1239,9 @@ class NetworkTrainer:
         """
         pass
 
-    def on_after_sample_images(self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype) -> None:
+    def on_after_sample_images(
+        self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype
+    ) -> None:
         """Called after sample image generation completes and the transformer has been switched back to training mode.
 
         Memory has already been cleaned via ``clean_memory_on_device``. Use this hook for
