@@ -24,7 +24,7 @@ from musubi_tuner.flux_2_train_network_wavelet_loss import (
     Flux2WaveletLossNetworkTrainer,
     wavelet_loss_setup_parser,
 )
-from musubi_tuner.hv_train_network import DiTOutput, setup_parser_common, read_config_from_file
+from musubi_tuner.hv_train_network import setup_parser_common, read_config_from_file
 from musubi_tuner.training.orchestrator import TrainerOrchestrator
 
 logger = logging.getLogger(__name__)
@@ -58,8 +58,8 @@ class BooTrainerOrchestrator(TrainerOrchestrator):
         latents: torch.Tensor,
         noise: torch.Tensor,
         noise_scheduler,
-        dit_dtype: torch.dtype,
-        network_dtype: torch.dtype,
+        dit_dtype: "torch.dtype",  # pyright: ignore[reportPrivateImportUsage]
+        network_dtype: "torch.dtype",  # pyright: ignore[reportPrivateImportUsage]
         vae,
         global_step: int,
     ) -> tuple[torch.Tensor, dict[str, float]]:
