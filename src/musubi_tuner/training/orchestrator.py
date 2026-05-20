@@ -81,27 +81,27 @@ class TrainerOrchestrator(NetworkTrainer):
         for ext in self._dispatch_table.get("handle_model_specific_args", []):
             ext.handle_model_specific_args(args)
 
-    def on_transformer_loaded(self, **kwargs: Any) -> None:
+    def on_transformer_loaded(self, **kwargs: Any) -> None:  # type: ignore[override]
         for ext in self._dispatch_table.get("on_transformer_loaded", []):
             ext.on_transformer_loaded(**kwargs)
 
-    def on_train_start(self, **kwargs: Any) -> None:
+    def on_train_start(self, **kwargs: Any) -> None:  # type: ignore[override]
         for ext in self._dispatch_table.get("on_train_start", []):
             ext.on_train_start(**kwargs)
 
-    def on_post_optimizer_step(self, **kwargs: Any) -> None:
+    def on_post_optimizer_step(self, **kwargs: Any) -> None:  # type: ignore[override]
         for ext in self._dispatch_table.get("on_post_optimizer_step", []):
             ext.on_post_optimizer_step(**kwargs)
 
-    def on_post_save(self, **kwargs: Any) -> None:
+    def on_post_save(self, **kwargs: Any) -> None:  # type: ignore[override]
         for ext in self._dispatch_table.get("on_post_save", []):
             ext.on_post_save(**kwargs)
 
-    def on_before_sample_images(self, **kwargs: Any) -> None:
+    def on_before_sample_images(self, **kwargs: Any) -> None:  # type: ignore[override]
         for ext in self._dispatch_table.get("on_before_sample_images", []):
             ext.on_before_sample_images(**kwargs)
 
-    def on_after_sample_images(self, **kwargs: Any) -> None:
+    def on_after_sample_images(self, **kwargs: Any) -> None:  # type: ignore[override]
         for ext in self._dispatch_table.get("on_after_sample_images", []):
             ext.on_after_sample_images(**kwargs)
 
@@ -135,7 +135,7 @@ class TrainerOrchestrator(NetworkTrainer):
 
     # region contended hooks — subclass must override if any extension registers
 
-    def process_batch(self, **kwargs: Any):
+    def process_batch(self, **kwargs: Any):  # type: ignore[override]
         if self._dispatch_table.get("process_batch"):
             names = [type(e).__name__ for e in self._dispatch_table["process_batch"]]
             raise NotImplementedError(
@@ -144,7 +144,7 @@ class TrainerOrchestrator(NetworkTrainer):
             )
         return super().process_batch(**kwargs)
 
-    def compute_loss(self, **kwargs: Any):
+    def compute_loss(self, **kwargs: Any):  # type: ignore[override]
         if self._dispatch_table.get("compute_loss"):
             names = [type(e).__name__ for e in self._dispatch_table["compute_loss"]]
             raise NotImplementedError(
