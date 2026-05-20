@@ -59,6 +59,7 @@ dev = [
   "tensorboard",
   "prompt-toolkit==3.0.51",
   "ruff>=0.12.10",
+  "pytest>=9.0.3",
 ]
 
 [build-system]
@@ -183,3 +184,9 @@ docstring-code-line-length = "dynamic"
 "src/musubi_tuner/wan/utils/fm_solvers.py" = ["ALL"]
 "src/musubi_tuner/wan/utils/fm_solvers_unipc.py" = ["ALL"]
 "src/musubi_tuner/wan/utils/utils.py" = ["ALL"]
+
+[tool.pyright]
+include = ["src", "tests"]
+venvPath = "."
+venv = ".venv"
+extraPaths = ["src"]

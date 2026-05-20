@@ -135,7 +135,7 @@ class TrainerOrchestrator(NetworkTrainer):
 
     # region contended hooks — subclass must override if any extension registers
 
-    def process_batch(self, **kwargs: Any):  # type: ignore[override]
+    def process_batch(self, **kwargs: Any):  # type: ignore[override]  # pyright: ignore[reportIncompatibleMethodOverride]
         if self._dispatch_table.get("process_batch"):
             names = [type(e).__name__ for e in self._dispatch_table["process_batch"]]
             raise NotImplementedError(
@@ -144,7 +144,7 @@ class TrainerOrchestrator(NetworkTrainer):
             )
         return super().process_batch(**kwargs)
 
-    def compute_loss(self, **kwargs: Any):  # type: ignore[override]
+    def compute_loss(self, **kwargs: Any):  # type: ignore[override]  # pyright: ignore[reportIncompatibleMethodOverride]
         if self._dispatch_table.get("compute_loss"):
             names = [type(e).__name__ for e in self._dispatch_table["compute_loss"]]
             raise NotImplementedError(

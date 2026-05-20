@@ -20,46 +20,46 @@ class _VoidExt(NetworkTrainer):
         super().__init__()
         self.calls = []
 
-    def on_train_start(self, **kwargs):  # type: ignore[override]
+    def on_train_start(self, **_kwargs):  # type: ignore[override]
         self.calls.append("on_train_start")
 
-    def on_post_optimizer_step(self, **kwargs):  # type: ignore[override]
+    def on_post_optimizer_step(self, **_kwargs):  # type: ignore[override]
         self.calls.append("on_post_optimizer_step")
 
 
 class _DictExt(NetworkTrainer):
-    def extra_metadata(self, args):  # type: ignore[override]
+    def extra_metadata(self, _args):  # type: ignore[override]
         return {"key_a": "val_a"}
 
-    def extra_step_logs(self, args, logs):  # type: ignore[override]
+    def extra_step_logs(self, _args, _logs):  # type: ignore[override]
         return {"log_a": 1.0}
 
 
 class _DictExt2(NetworkTrainer):
-    def extra_metadata(self, args):  # type: ignore[override]
+    def extra_metadata(self, _args):  # type: ignore[override]
         return {"key_b": "val_b"}
 
-    def extra_step_logs(self, args, logs):  # type: ignore[override]
+    def extra_step_logs(self, _args, _logs):  # type: ignore[override]
         return {"log_b": 2.0}
 
 
 class _ChainExt(NetworkTrainer):
-    def extra_trainable_params(self, args, accelerator, network, transformer, trainable_params):  # type: ignore[override]
+    def extra_trainable_params(self, _args, _accelerator, _network, _transformer, trainable_params):  # type: ignore[override]
         return trainable_params + ["param_a"]
 
 
 class _ChainExt2(NetworkTrainer):
-    def extra_trainable_params(self, args, accelerator, network, transformer, trainable_params):  # type: ignore[override]
+    def extra_trainable_params(self, _args, _accelerator, _network, _transformer, trainable_params):  # type: ignore[override]
         return trainable_params + ["param_b"]
 
 
 class _ProcessBatchExt(NetworkTrainer):
-    def process_batch(self, **kwargs):  # type: ignore[override]
+    def process_batch(self, **_kwargs):  # type: ignore[override]  # pyright: ignore[reportIncompatibleMethodOverride]
         return None, {}
 
 
 class _ComputeLossExt(NetworkTrainer):
-    def compute_loss(self, **kwargs):  # type: ignore[override]
+    def compute_loss(self, **_kwargs):  # type: ignore[override]  # pyright: ignore[reportIncompatibleMethodOverride]
         return None, {}
 
 
