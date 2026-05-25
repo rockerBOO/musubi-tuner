@@ -1241,6 +1241,11 @@ class NetworkTrainer:
 
         Use for cleanup of any resources initialized in ``on_train_start`` (e.g. closing
         profilers, flushing buffers, stopping background threads).
+
+        Note: in multi-GPU runs this is called on all processes. ``network`` is
+        already ``accelerator.unwrap_model(network)`` on the main process but
+        remains accelerator-wrapped on worker processes — do not act on ``network``
+        here unless you guard on ``accelerator.is_main_process``.
         """
         pass
 
