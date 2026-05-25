@@ -1221,12 +1221,14 @@ class NetworkTrainer:
         Use for per-step timing or gradient-scaling hooks. ``loss`` is the
         scalar tensor returned by ``process_batch``.
         """
+        pass
 
     def on_after_backward(self) -> None:
         """Called immediately after ``accelerator.backward(loss)`` returns.
 
         Use for per-step timing or any post-backward, pre-optimizer-step work.
         """
+        pass
 
     def on_post_save(
         self,
