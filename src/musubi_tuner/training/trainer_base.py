@@ -1215,6 +1215,19 @@ class NetworkTrainer:
         Use for EMA updates or any post-step bookkeeping.
         """
 
+    def on_before_backward(self, loss: torch.Tensor) -> None:
+        """Called immediately before ``accelerator.backward(loss)``.
+
+        Use for per-step timing or gradient-scaling hooks. ``loss`` is the
+        scalar tensor returned by ``process_batch``.
+        """
+
+    def on_after_backward(self) -> None:
+        """Called immediately after ``accelerator.backward(loss)`` returns.
+
+        Use for per-step timing or any post-backward, pre-optimizer-step work.
+        """
+
     def on_post_save(
         self,
         args: argparse.Namespace,
@@ -2030,7 +2043,9 @@ class NetworkTrainer:
                         global_step,
                     )
 
+                    self.on_before_backward(loss)
                     accelerator.backward(loss)
+                    self.on_after_backward()
                     if accelerator.sync_gradients:
                         # self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         state = accelerate.PartialState()
