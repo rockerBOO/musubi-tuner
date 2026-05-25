@@ -126,21 +126,27 @@ class Flux2ProfilerNetworkTrainer(Flux2NetworkTrainer):
     def process_batch(self, args, accelerator, transformer, network, batch, latents, noise,
                       noise_scheduler, dit_dtype, network_dtype, vae, global_step):
         self._t_step_start = time.perf_counter()
+        torch.cuda.nvtx.range_push("forward")
         result = super().process_batch(
             args, accelerator, transformer, network, batch, latents, noise,
             noise_scheduler, dit_dtype, network_dtype, vae, global_step,
         )
+        torch.cuda.nvtx.range_pop()
         self._t_forward_end = time.perf_counter()
         return result
 
     def on_before_backward(self, loss: torch.Tensor) -> None:  # noqa: ARG002
         self._t_backward_start = time.perf_counter()
+        torch.cuda.nvtx.range_push("backward")
 
     def on_after_backward(self) -> None:
+        torch.cuda.nvtx.range_pop()
         self._t_backward_end = time.perf_counter()
 
     def on_post_optimizer_step(self, args, accelerator, network, transformer, sync_gradients, global_step) -> None:
+        torch.cuda.nvtx.range_push("optimizer")
         self._t_optimizer_end = time.perf_counter()
+        torch.cuda.nvtx.range_pop()
         # Advance the profiler schedule unconditionally — extra_step_logs is only
         # called when a tracker (wandb/tensorboard) is registered, so profiler.step()
         # must live here to ensure the schedule always advances.
