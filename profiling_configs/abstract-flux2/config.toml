@@ -1,0 +1,50 @@
+sdpa = true
+model_version = "klein-base-4b"
+
+# Run just enough steps to get through the profiler window (warmup + active)
+max_train_steps = 20
+seed = 42
+
+save_model_as = "safetensors"
+save_every_n_steps = 99999  # don't save during profiling
+
+batch_size = 2
+gradient_accumulation_steps = 1
+
+gradient_checkpointing = true
+cache_latents = true
+cache_latents_to_disk = true
+cache_text_encoder_outputs = true
+cache_text_encoder_outputs_to_disk = true
+
+fp8_base = true
+fp8_scaled = true
+fp8_text_encoder = true
+
+use_pinned_memory_for_block_swap = true
+persistent_data_loader_workers = true
+max_data_loader_n_workers = 4
+pin_memory = true
+
+network_module = "networks.lora_flux_2"
+network_train_unet_only = true
+network_dim = 8
+network_alpha = 16
+network_args = [
+  "img_dim=4",
+  "img_alpha=8",
+  "txt_dim=16",
+  "txt_alpha=32",
+]
+
+# Simple AdamW — no custom optimizer needed for profiling
+optimizer_type = "AdamW"
+optimizer_args = ["weight_decay=0.01"]
+learning_rate = 1e-4
+unet_lr = 1e-4
+max_grad_norm = 1.0
+
+weighting_scheme = "logit_normal"
+logit_mean = 0.0
+logit_std = 1.0
+model_prediction_type = "raw"

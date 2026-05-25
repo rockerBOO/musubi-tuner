@@ -14,21 +14,10 @@ uv run --no-sync accelerate launch \
   --profile_warmup "${PROFILE_WARMUP:-2}" \
   --profile_steps "${PROFILE_STEPS:-5}" \
   --profile_output_dir "$PROFILE_DIR" \
-  --output_dir=/mnt/900/training/sets/abstract-flux2-2026-05-25-135724-9dfa189b \
-  --logging_dir=/mnt/900/training/log/abstract-flux2 \
-  --log_prefix=abstract-flux2-2026-05-25-135724-9dfa189b \
-  --config_file=/home/rockerboo/code/training_runs/abstract-flux2/abstract-flux2_config.toml \
-  --dataset_config=/home/rockerboo/code/training_runs/abstract-flux2/dataset_config.toml \
-  --output_name=abstract-flux2-2026-05-25-135724-9dfa189b \
-  --metadata_title=Abstract \
-  --metadata_author=rockerBOO \
-  '--metadata_description=Abstract stylized images' \
-  '--metadata_license=CreativeML Open RAIL-M' \
-  --metadata_tags=abstract \
-  --sample_prompts=/home/rockerboo/code/training_runs/abstract-flux2/abstract-flux2.txt \
-  '--training_comment=Trained by: rockerBOO' \
-  --log_tracker_config=/home/rockerboo/code/training_runs/abstract-flux2/abstract-flux2_log_config.toml \
-  --log_tracker_name=abstract-flux2-kohya-lora \
+  --config_file=profiling_configs/abstract-flux2/config.toml \
+  --dataset_config=profiling_configs/abstract-flux2/dataset_config.toml \
+  --output_dir="$PROFILE_DIR/output" \
+  --output_name=profiling-abstract-flux2 \
   --dit=/mnt/500c/models/diffusion/flux2/flux-2-klein-base-4b.safetensors \
   --text_encoder=/mnt/500c/models/text_encoders/qwen_3_4b.safetensors \
   --vae=/mnt/900/vae/flux2-vae-non-diffusers.safetensors \

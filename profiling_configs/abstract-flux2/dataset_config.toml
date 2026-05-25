@@ -1,0 +1,8 @@
+[general]
+caption_extension = ".txt"
+enable_bucket = true
+bucket_no_upscale = true
+
+[[datasets]]
+image_directory = "/mnt/900/input/abstract/s4"
+cache_directory = "/mnt/900/input/abstract/cache/s4"
