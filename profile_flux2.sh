@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # profile_flux2.sh — run Flux2 training with PyTorch profiler
 #
-# Usage:
-#   ./profile_flux2.sh --dataset_config my.toml --output_dir output [all normal training args]
+# Usage (drop-in for your normal training command):
+#   ./profile_flux2.sh \
+#     --config_file=/path/to/config.toml \
+#     --dataset_config=/path/to/dataset_config.toml \
+#     --dit=... --text_encoder=... --vae=... [all other normal args]
 #
 # Env vars (optional overrides):
 #   PROFILE_WARMUP=N        steps to skip before recording (default: 2)
@@ -21,10 +24,10 @@ PROFILE_DIR="${PROFILE_OUTPUT_DIR:-profiling}/$TIMESTAMP"
 PROFILE_SUFFIX=$(( ${PROFILE_WARMUP:-2} + ${PROFILE_STEPS:-5} ))
 mkdir -p "$PROFILE_DIR"
 
-accelerate launch \
+uv run --no-sync accelerate launch \
   --num_cpu_threads_per_process 1 \
   --mixed_precision "${MIXED_PRECISION:-bf16}" \
-  src/musubi_tuner/flux_2_profiler_train_network.py \
+  flux_2_profiler_train_network.py \
   --profile_warmup "${PROFILE_WARMUP:-2}" \
   --profile_steps "${PROFILE_STEPS:-5}" \
   --profile_output_dir "$PROFILE_DIR" \
