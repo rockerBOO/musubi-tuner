@@ -97,9 +97,7 @@ class Flux2ProfilerNetworkTrainer(Flux2NetworkTrainer):
                 metric="self_cuda_time_total",
             )
             logger.info(f"Profiling trace saved to {output_dir}/trace_{step}.json")
-            print(
-                p.key_averages().table(sort_by="cuda_time_total", row_limit=20)
-            )
+            logger.info(p.key_averages().table(sort_by="cuda_time_total", row_limit=20))
 
         self.profiler = torch.profiler.profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -135,7 +133,7 @@ class Flux2ProfilerNetworkTrainer(Flux2NetworkTrainer):
         self._t_forward_end = time.perf_counter()
         return result
 
-    def on_before_backward(self, loss: torch.Tensor) -> None:
+    def on_before_backward(self, loss: torch.Tensor) -> None:  # noqa: ARG002
         self._t_backward_start = time.perf_counter()
 
     def on_after_backward(self) -> None:
@@ -143,7 +141,18 @@ class Flux2ProfilerNetworkTrainer(Flux2NetworkTrainer):
 
     def on_post_optimizer_step(self, args, accelerator, network, transformer, sync_gradients, global_step) -> None:
         self._t_optimizer_end = time.perf_counter()
+        # Advance the profiler schedule unconditionally — extra_step_logs is only
+        # called when a tracker (wandb/tensorboard) is registered, so profiler.step()
+        # must live here to ensure the schedule always advances.
+        if self.profiler is not None:
+            self.profiler.step()
         super().on_post_optimizer_step(args, accelerator, network, transformer, sync_gradients, global_step)
+
+    def on_train_end(self, args, accelerator, network, transformer) -> None:
+        if self.profiler is not None:
+            self.profiler.__exit__(None, None, None)
+            self.profiler = None
+        super().on_train_end(args, accelerator, network, transformer)
 
     # endregion
 
@@ -156,9 +165,6 @@ class Flux2ProfilerNetworkTrainer(Flux2NetworkTrainer):
         }
 
     def extra_step_logs(self, args: argparse.Namespace, logs: dict) -> dict:
-        if self.profiler is not None:
-            self.profiler.step()
-
         result = super().extra_step_logs(args, logs)
         result.update(self._compute_timing_logs())
         return result

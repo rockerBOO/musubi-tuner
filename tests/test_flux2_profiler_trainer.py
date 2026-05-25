@@ -1,9 +1,7 @@
 import argparse
 import time
-import pytest
-import torch
 
-from musubi_tuner.flux_2_profiler_train_network import Flux2ProfilerNetworkTrainer
+from musubi_tuner.flux_2_profiler_train_network import Flux2ProfilerNetworkTrainer, add_profiler_args
 
 
 def make_trainer_with_state(forward_ms=10, backward_ms=5, optimizer_ms=3):
@@ -15,13 +13,12 @@ def make_trainer_with_state(forward_ms=10, backward_ms=5, optimizer_ms=3):
     trainer._t_backward_start = now + forward_ms / 1000
     trainer._t_backward_end = now + (forward_ms + backward_ms) / 1000
     trainer._t_optimizer_end = now + (forward_ms + backward_ms + optimizer_ms) / 1000
-    trainer.profiler = None  # will be skipped in extra_step_logs if None
+    trainer.profiler = None
     return trainer
 
 
 def test_extra_step_logs_returns_timing_keys():
     trainer = make_trainer_with_state()
-    args = argparse.Namespace()
     logs = trainer._compute_timing_logs()
 
     assert "profile/forward_ms" in logs
@@ -50,8 +47,6 @@ def test_step_ms_equals_sum_of_phases():
 
 def test_profiler_args_defaults():
     """Parser defaults match documented values."""
-    import argparse
-    from musubi_tuner.flux_2_profiler_train_network import add_profiler_args
     parser = argparse.ArgumentParser()
     add_profiler_args(parser)
     args = parser.parse_args([])
@@ -59,3 +54,13 @@ def test_profiler_args_defaults():
     assert args.profile_warmup == 2
     assert args.profile_steps == 5
     assert args.profile_output_dir == "profiling"
+
+
+def test_extra_step_logs_with_no_profiler_returns_timing():
+    """extra_step_logs works and returns timing keys even when profiler is None."""
+    trainer = make_trainer_with_state()
+    assert trainer.profiler is None
+    logs = trainer.extra_step_logs(argparse.Namespace(), {})
+
+    assert "profile/forward_ms" in logs
+    assert "profile/step_ms" in logs

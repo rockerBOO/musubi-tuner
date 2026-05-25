@@ -1230,6 +1230,20 @@ class NetworkTrainer:
         """
         pass
 
+    def on_train_end(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network,
+        transformer,
+    ) -> None:
+        """Called once after the training loop exits and before ``accelerator.end_training()``.
+
+        Use for cleanup of any resources initialized in ``on_train_start`` (e.g. closing
+        profilers, flushing buffers, stopping background threads).
+        """
+        pass
+
     def on_post_save(
         self,
         args: argparse.Namespace,
@@ -2157,6 +2171,8 @@ class NetworkTrainer:
 
         if is_main_process:
             network = accelerator.unwrap_model(network)
+
+        self.on_train_end(args, accelerator, network, transformer)
 
         accelerator.end_training()
         optimizer_eval_fn()
