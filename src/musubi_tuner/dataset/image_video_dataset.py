@@ -516,7 +516,21 @@ class ImageDataset(BaseDataset):
                 logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
                 continue
 
-            bucket_reso = bucket_selector.get_bucket_resolution(image_size)
+            # Read keys from cache file header (no tensor data loaded) to get actual latent shape.
+            # Using the actual cached latent dims as the bucket key ensures items with different
+            # latent shapes (e.g. from mismatched caching/training resolution configs) are never batched together.
+            with safetensors_utils.MemoryEfficientSafeOpen(cache_file) as f:
+                file_keys = f.keys()
+            latent_key = next(
+                (k for k in file_keys if k.startswith("latents_") and not k.startswith("latents_control_") and not k.endswith("_mask")),
+                None,
+            )
+            if latent_key is not None:
+                # "latents_78x52_bfloat16" -> "78x52" -> (78, 52)
+                dims_str = latent_key[len("latents_") :].rsplit("_", 1)[0]
+                bucket_reso = tuple(map(int, dims_str.split("x")))
+            else:
+                bucket_reso = bucket_selector.get_bucket_resolution(image_size)
 
             if self.architecture == ARCHITECTURE_FRAMEPACK or self.architecture == ARCHITECTURE_WAN:
                 # we need to split the bucket with latent window size and optional 1f clean indices, zero post
@@ -527,7 +541,7 @@ class ImageDataset(BaseDataset):
                 bucket_reso = tuple(bucket_reso)
             if self.no_resize_control or self.control_resolution is not None:
                 # we also need to split the bucket with control resolutions
-                control_key = safetensors_utils.find_key(cache_file, starts_with="latents_control_")  # latents_control_FxHxW_dtype
+                control_key = next((k for k in file_keys if k.startswith("latents_control_")), None)
                 if control_key is not None:
                     control_shape = control_key.rsplit("_", 3)[-2]  # FxHxW
                     bucket_reso = tuple(list(bucket_reso) + [control_shape])  # (int, int, str)
