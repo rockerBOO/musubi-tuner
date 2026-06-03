@@ -33,12 +33,19 @@ _DISABLE_FLASH_SDP = _check_disable_flash_sdp()
 
 
 def _sdp_ctx():
-    """Fresh context manager for each SDPA call."""
-    if _DISABLE_FLASH_SDP:
-        return torch.backends.cuda.sdp_kernel(
+    """Fresh context manager for each SDPA call — excludes cuDNN/flash backends."""
+    if not _DISABLE_FLASH_SDP:
+        return contextlib.nullcontext()
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        # Explicitly enumerate safe backends; this excludes both FLASH_ATTENTION
+        # and CUDNN_ATTENTION which are the buggy paths on Blackwell.
+        return sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH])
+    except (ImportError, AttributeError):
+        # Pre-2.1 fallback — deprecated but functional on older builds
+        return torch.backends.cuda.sdp_kernel(  # type: ignore[attr-defined]
             enable_flash=False, enable_math=True, enable_mem_efficient=True
         )
-    return contextlib.nullcontext()
 
 try:
     import flash_attn
