@@ -1,8 +1,44 @@
 # Unified attention function supporting various implementations
 
+import contextlib
+import os
 from dataclasses import dataclass
-import torch
 from typing import Optional, Union
+
+import torch
+
+
+def _check_disable_flash_sdp() -> bool:
+    """Return True if flash/cuDNN SDP should be disabled for this GPU.
+
+    Blackwell GPUs (sm_12x) have a bug in cuDNN's flash attention backward
+    that produces NaN gradients.  Set MUSUBI_FORCE_FLASH_SDP=1 to override
+    and keep flash enabled regardless of GPU.
+    """
+    if os.environ.get("MUSUBI_FORCE_FLASH_SDP", "0") == "1":
+        return False
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability()
+    if major >= 12:  # Blackwell (sm_12x) and above
+        print(
+            "attention: Blackwell GPU detected — disabling cuDNN/flash SDP "
+            "(set MUSUBI_FORCE_FLASH_SDP=1 to override)"
+        )
+        return True
+    return False
+
+
+_DISABLE_FLASH_SDP = _check_disable_flash_sdp()
+
+
+def _sdp_ctx():
+    """Fresh context manager for each SDPA call."""
+    if _DISABLE_FLASH_SDP:
+        return torch.backends.cuda.sdp_kernel(
+            enable_flash=False, enable_math=True, enable_mem_efficient=True
+        )
+    return contextlib.nullcontext()
 
 try:
     import flash_attn
@@ -178,20 +214,21 @@ def attention(
         v = transpose_fn(v)
 
     if attn_params.attn_mode == "torch":
-        if attn_params.split_attn:
-            x = []
-            for i in range(len(q)):
-                x_i = torch.nn.functional.scaled_dot_product_attention(q[i], k[i], v[i], dropout_p=drop_rate)
-                q[i] = None
-                k[i] = None
-                v[i] = None
-                x.append(pad_fn(x_i, attn_params.max_seqlen))  # B, H, L, D
-            x = torch.cat(x, dim=0)
-            q, k, v = None, None, None
+        with _sdp_ctx():
+            if attn_params.split_attn:
+                x = []
+                for i in range(len(q)):
+                    x_i = torch.nn.functional.scaled_dot_product_attention(q[i], k[i], v[i], dropout_p=drop_rate)
+                    q[i] = None
+                    k[i] = None
+                    v[i] = None
+                    x.append(pad_fn(x_i, attn_params.max_seqlen))  # B, H, L, D
+                x = torch.cat(x, dim=0)
+                q, k, v = None, None, None
 
-        else:
-            x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_params.attention_mask, dropout_p=drop_rate)
-            q, k, v = None, None, None
+            else:
+                x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_params.attention_mask, dropout_p=drop_rate)
+                q, k, v = None, None, None
 
     elif attn_params.attn_mode == "xformers":
         if attn_params.split_attn:
