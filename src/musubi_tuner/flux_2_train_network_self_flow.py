@@ -698,7 +698,7 @@ class Flux2SelfFlowNetworkTrainer(Flux2NetworkTrainer):
         feat_student = output.extra.get("features")
 
         # 5. L_gen via the base loss (weighting from student timesteps), then L_rep
-        L_gen, _ = self.compute_loss(args, output, timesteps_student, noise_scheduler, dit_dtype, network_dtype, global_step)
+        L_gen, gen_metrics = self.compute_loss(args, output, timesteps_student, noise_scheduler, dit_dtype, network_dtype, global_step)
 
         # Amendment 2: loud failure if feature hooks misconfigured; never silently drop L_rep.
         if feat_student is None or feat_teacher is None:
@@ -712,6 +712,7 @@ class Flux2SelfFlowNetworkTrainer(Flux2NetworkTrainer):
         L_rep = compute_representation_loss(feat_student, feat_teacher, self.rep_proj)
         loss = L_gen + gamma * L_rep
         loss_metrics = {
+            **gen_metrics,
             "loss/gen": L_gen.detach().item(),
             "loss/rep": L_rep.detach().item(),
         }

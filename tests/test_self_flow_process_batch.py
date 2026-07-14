@@ -77,6 +77,62 @@ def test_process_batch_self_flow_smoke(tiny_model):
     assert all(g is not None for g in grads)  # L_rep reached the projection head
 
 
+def test_process_batch_propagates_loss_fn_metrics(tiny_model):
+    """Custom --loss_fn metrics (e.g. wavelet band metrics) must survive the
+    self-flow path — process_batch must merge compute_loss's metrics dict into
+    loss_metrics, not discard it."""
+    torch.manual_seed(3)
+    trainer = Flux2SelfFlowNetworkTrainer()
+    args = make_args(
+        student_feature_layer=0,
+        teacher_feature_layer=2,
+        mask_ratio=0.25,
+        self_flow_gamma=0.8,
+        ema_decay=0.999,
+    )
+    acc = PreparingAccelerator()
+    trainer.handle_model_specific_args(args)
+    trainer.on_transformer_loaded(args, acc, tiny_model)
+    trainer.extra_trainable_params(args, acc, None, tiny_model, [])
+    net = StubNetwork()
+    trainer.on_train_start(args, acc, net, tiny_model, None)
+
+    # stand-in for a metrics-returning --loss_fn (e.g. wavelet_loss.musubi.WaveletPlusMSE)
+    def loss_with_metrics(ctx):
+        loss = torch.nn.functional.mse_loss(ctx.output.pred, ctx.output.target)
+        return loss, {"loss/custom_term": float(loss.detach())}
+
+    trainer._resolved_loss_fn = loss_with_metrics
+
+    B, H, W = 2, 4, 4
+    latents = torch.randn(B, 4, H, W)
+    noise = torch.randn_like(latents)
+    batch = {
+        "ctx_vec": torch.randn(B, 3, 8),
+        "timesteps": None,
+    }
+    scheduler = make_noise_scheduler(args)
+
+    _, metrics = trainer.process_batch(
+        args,
+        acc,
+        tiny_model,
+        net,
+        batch,
+        latents,
+        noise,
+        scheduler,
+        torch.float32,
+        torch.float32,
+        None,
+        global_step=10,
+    )
+    assert "loss/custom_term" in metrics, (
+        f"--loss_fn metrics were dropped by the self-flow process_batch; got {sorted(metrics)}"
+    )
+    assert "loss/gen" in metrics and "loss/rep" in metrics
+
+
 def test_process_batch_restores_student_weights_after_teacher_swap(tiny_model):
     """After the teacher forward, process_batch must restore the student LoRA weights.
 
