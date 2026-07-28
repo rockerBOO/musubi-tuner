@@ -654,6 +654,87 @@ class Krea2SelfFlowNetworkTrainer(Krea2NetworkTrainer):
 
         return loss, loss_metrics
 
+    def on_post_optimizer_step(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network,
+        transformer,
+        sync_gradients: bool,
+        global_step: int,
+    ) -> None:
+        """EMA update of LoRA weights only on real optimizer steps."""
+        super().on_post_optimizer_step(args, accelerator, network, transformer, sync_gradients, global_step)
+        if not args.self_flow or not sync_gradients or self.ema_lora_state is None:
+            return
+        update_ema_weights(self.ema_lora_state, accelerator.unwrap_model(network).state_dict(), args.ema_decay)
+
+    def on_post_save(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network,
+        transformer,
+        ckpt_name: str,
+        save_dtype,
+        metadata: dict,
+        force_sync_upload: bool,
+    ) -> None:
+        """Save EMA (teacher) and projection-head companion files."""
+        super().on_post_save(args, accelerator, network, transformer, ckpt_name, save_dtype, metadata, force_sync_upload)
+        if not args.self_flow:
+            return
+
+        unwrapped_nw = accelerator.unwrap_model(network)
+
+        if self.rep_proj is not None:
+            proj_ckpt_name = ckpt_name.replace(".safetensors", "-proj.safetensors")
+            proj_ckpt_file = os.path.join(args.output_dir, proj_ckpt_name)
+            accelerator.print(f"saving projection head: {proj_ckpt_file}")
+            proj_state = {
+                k: v.to(save_dtype) if save_dtype is not None else v
+                for k, v in accelerator.unwrap_model(self.rep_proj).state_dict().items()
+            }
+            save_file(proj_state, proj_ckpt_file)
+            if args.huggingface_repo_id is not None:
+                huggingface_utils.upload(args, proj_ckpt_file, "/" + proj_ckpt_name, force_sync_upload=force_sync_upload)
+
+        if self.ema_lora_state is not None:
+            ema_ckpt_name = ckpt_name.replace(".safetensors", "-ema.safetensors")
+            ema_ckpt_file = os.path.join(args.output_dir, ema_ckpt_name)
+            accelerator.print(f"saving EMA checkpoint: {ema_ckpt_file}")
+            student_state = {k: v.clone() for k, v in unwrapped_nw.state_dict().items()}
+            unwrapped_nw.load_state_dict(self.ema_lora_state)
+            try:
+                unwrapped_nw.save_weights(ema_ckpt_file, save_dtype, metadata)
+            finally:
+                unwrapped_nw.load_state_dict(student_state)
+            if args.huggingface_repo_id is not None:
+                huggingface_utils.upload(args, ema_ckpt_file, "/" + ema_ckpt_name, force_sync_upload=force_sync_upload)
+
+    def extra_metadata(self, args: argparse.Namespace) -> dict:
+        """Return ``ss_self_flow_*`` keys for embedding into safetensors metadata."""
+        if not args.self_flow:
+            return {}
+        return {
+            "ss_self_flow": True,
+            "ss_self_flow_gamma": args.self_flow_gamma,
+            "ss_self_flow_gamma_warmup_steps": args.self_flow_gamma_warmup_steps,
+            "ss_self_flow_mask_ratio": args.mask_ratio,
+            "ss_self_flow_ema_decay": args.ema_decay,
+            "ss_self_flow_student_layer": args.student_feature_layer,
+            "ss_self_flow_teacher_layer": args.teacher_feature_layer,
+            "ss_self_flow_teacher_coupling_prob": args.self_flow_teacher_coupling_prob,
+            "ss_self_flow_teacher_coupling_decay": args.self_flow_teacher_coupling_decay,
+            "ss_self_flow_teacher_mismatch_ratio": args.self_flow_teacher_mismatch_ratio,
+        }
+
+    def extra_step_logs(self, args: argparse.Namespace, logs: dict) -> dict:
+        """Drain per-step Self-Flow metrics into the trainer's log payload."""
+        if not args.self_flow:
+            return {}
+        return dict(self._self_flow_logs)
+
 
 def self_flow_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Self-Flow-specific CLI arguments. Mirrors flux_2_train_network_self_flow.py's additions."""
