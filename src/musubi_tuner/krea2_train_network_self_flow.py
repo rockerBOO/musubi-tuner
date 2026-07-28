@@ -262,6 +262,62 @@ class PerTokenModulationController:
         return scale, shift
 
 
+class BlockFeatureExtractor:
+    """Captures hidden states from K2 SingleStreamBlocks via forward hooks.
+
+    K2 has a single ``model.blocks`` list (no double/single split like
+    FLUX.2), so layer indexing is a direct ``model.blocks[layer]`` — no
+    branching logic needed. Each block returns the full ``combined``
+    (img+txt+pad) tensor; K2's image-first token ordering makes the
+    image-token slice a simple prefix (``output[:, :imglen, :]``).
+
+    Blocks self-checkpoint internally, so hook outputs are differentiable
+    even with gradient checkpointing enabled.
+    """
+
+    def __init__(self) -> None:
+        self._handles: list = []
+        self._installed_layers: set[int] = set()
+        self._armed_layer: Optional[int] = None
+        self._imglen: Optional[int] = None
+        self._features: Optional[torch.Tensor] = None
+
+    def install(self, model, layer_indices: list[int]) -> None:
+        num_blocks = len(model.blocks)
+        for layer in sorted(set(layer_indices)):
+            if not 0 <= layer < num_blocks:
+                raise ValueError(f"feature layer {layer} out of range (model has {num_blocks} blocks)")
+            handle = model.blocks[layer].register_forward_hook(self._make_hook(layer))
+            self._handles.append(handle)
+            self._installed_layers.add(layer)
+
+    def remove(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+
+    def arm(self, layer: int, imglen: int) -> None:
+        if layer not in self._installed_layers:
+            raise ValueError(f"feature layer {layer} was not installed (installed: {sorted(self._installed_layers)})")
+        self._armed_layer = layer
+        self._imglen = imglen
+        self._features = None
+
+    def drain(self) -> Optional[torch.Tensor]:
+        features = self._features
+        self._features = None
+        self._armed_layer = None
+        self._imglen = None
+        return features
+
+    def _make_hook(self, layer: int):
+        def hook(module, inputs, output):
+            if self._armed_layer == layer:
+                self._features = output[:, : self._imglen, :]
+
+        return hook
+
+
 class Krea2SelfFlowNetworkTrainer(Krea2NetworkTrainer):
     pass
 
