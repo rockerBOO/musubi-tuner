@@ -530,6 +530,130 @@ class Krea2SelfFlowNetworkTrainer(Krea2NetworkTrainer):
             output.extra["features"] = features
         return output
 
+    def process_batch(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer,
+        network,
+        batch: dict[str, torch.Tensor],
+        latents: torch.Tensor,
+        noise: torch.Tensor,
+        noise_scheduler,
+        dit_dtype: torch.dtype,
+        network_dtype: torch.dtype,
+        vae,
+        global_step: int,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Self-Flow step replacing vanilla flow matching. See
+        flux_2_train_network_self_flow.py's process_batch for the reference
+        this mirrors; the only architecture-specific differences are the
+        patch-token-aware apply_per_token_mask (Task 3) and the block-swap
+        re-prepare call (K2's SingleStreamDiT has its own
+        prepare_block_swap_before_forward, same as FLUX.2's transformer)."""
+        if not args.self_flow:
+            return super().process_batch(
+                args, accelerator, transformer, network, batch, latents, noise, noise_scheduler, dit_dtype, network_dtype, vae, global_step
+            )
+
+        # 1. two timestep draws; per-sample teacher = min, student = max (paper Sec 3.3)
+        _, timesteps_a = self.get_noisy_model_input_and_timesteps(
+            args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
+        )
+        _, timesteps_b = self.get_noisy_model_input_and_timesteps(
+            args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
+        )
+        timesteps_teacher, timesteps_student = assign_teacher_student_timesteps(timesteps_a, timesteps_b)
+
+        # 2. noisy inputs + per-patch-token mask (masked tokens take the cleaner teacher noise)
+        noisy_input_teacher = reconstruct_noisy_input(latents, noise, timesteps_teacher)
+        noisy_input_student = reconstruct_noisy_input(latents, noise, timesteps_student)
+        model = accelerator.unwrap_model(transformer)
+        patch = model.config.patch
+        B = latents.shape[0]
+        coin = torch.rand(B, device=accelerator.device) < 0.5
+        effective_ratio = torch.where(
+            coin,
+            torch.full((B,), args.mask_ratio, device=accelerator.device),
+            torch.full((B,), 1.0 - args.mask_ratio, device=accelerator.device),
+        )
+        noisy_input_student, mask_flat = apply_per_token_mask(
+            noisy_input_student, noisy_input_teacher, effective_ratio, patch, accelerator.device
+        )
+
+        coupling_prob = args.self_flow_teacher_coupling_prob
+        gate_open = coupling_prob > 0.0 and torch.rand(1).item() < coupling_prob
+        effective_mismatch = args.self_flow_teacher_mismatch_ratio if gate_open else 0.0
+        per_token_timesteps_student, mismatch_mask = build_per_token_timestep_map(
+            timesteps_teacher, timesteps_student, mask_flat, mismatch_prob=effective_mismatch
+        )
+
+        # 3. teacher forward: EMA weights, no grad, uniform (cleaner) timestep
+        unwrapped_nw = accelerator.unwrap_model(network)
+        student_lora_state = {k: v.clone() for k, v in unwrapped_nw.state_dict().items()}
+        unwrapped_nw.load_state_dict(self.ema_lora_state)
+        try:
+            with torch.no_grad():
+                output = self.call_dit(
+                    args, accelerator, transformer, latents, batch, noise,
+                    noisy_input_teacher, timesteps_teacher, network_dtype,
+                    hidden_features=True, feature_layer=args.teacher_feature_layer,
+                )
+                feat_teacher = output.extra.get("features")
+                feat_teacher = feat_teacher.detach() if feat_teacher is not None else None
+        finally:
+            unwrapped_nw.load_state_dict(student_lora_state)
+        # block swap ran forward-only for the teacher; re-prepare device placement
+        accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
+
+        # 4. student forward: gradients flow, per-token timesteps via hooks
+        output = self.call_dit(
+            args, accelerator, transformer, latents, batch, noise,
+            noisy_input_student, timesteps_student, network_dtype,
+            hidden_features=True, feature_layer=args.student_feature_layer,
+            per_token_timesteps=per_token_timesteps_student,
+        )
+        feat_student = output.extra.get("features")
+
+        # 5. L_gen via the base loss (weighting from student timesteps), then L_rep
+        L_gen, gen_metrics = self.compute_loss(args, output, timesteps_student, noise_scheduler, dit_dtype, network_dtype, global_step)
+
+        if feat_student is None or feat_teacher is None:
+            raise RuntimeError(
+                f"Self-Flow: feature capture returned None "
+                f"(student={feat_student is not None}, teacher={feat_teacher is not None}) "
+                "— feature hooks misconfigured"
+            )
+
+        gamma = effective_gamma(args.self_flow_gamma, global_step, args.self_flow_gamma_warmup_steps)
+        L_rep = compute_representation_loss(feat_student, feat_teacher, self.rep_proj)
+        loss = L_gen + gamma * L_rep
+        loss_metrics = {
+            **gen_metrics,
+            "loss/gen": L_gen.detach().item(),
+            "loss/rep": L_rep.detach().item(),
+        }
+
+        # 6. state metrics drained later by extra_step_logs
+        ema_drift = compute_ema_weight_drift(self.ema_lora_state, unwrapped_nw.state_dict())
+        self._self_flow_logs = {
+            "self_flow/gamma": gamma,
+            "self_flow/feat_cosine_sim": -L_rep.detach().item(),
+            "self_flow/timestep_student_mean": timesteps_student.float().mean().item(),
+            "self_flow/timestep_teacher_mean": timesteps_teacher.float().mean().item(),
+            "self_flow/timestep_diff": (timesteps_student.float().mean() - timesteps_teacher.float().mean()).item(),
+            "self_flow/teacher_coupling_prob": coupling_prob,
+            "self_flow/actual_mask_ratio": mask_flat.float().mean().item(),
+            "self_flow/cleaner_fraction_mean": effective_ratio.mean().item(),
+            "self_flow/ema_weight_drift": ema_drift.item(),
+        }
+        masked_count = mask_flat.sum().item()
+        mismatch_count = mismatch_mask.sum().item()
+        self._self_flow_logs["self_flow/mismatch_patch_count"] = mismatch_count
+        self._self_flow_logs["self_flow/mismatch_patch_frac"] = mismatch_count / masked_count if masked_count > 0 else 0.0
+
+        return loss, loss_metrics
+
 
 def self_flow_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Self-Flow-specific CLI arguments. Mirrors flux_2_train_network_self_flow.py's additions."""
