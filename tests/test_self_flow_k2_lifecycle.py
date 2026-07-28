@@ -95,3 +95,46 @@ def test_network_weights_ema_without_network_weights_raises():
     args = make_args(network_weights_ema="ema.safetensors", network_weights=None)
     with pytest.raises(ValueError, match="network_weights"):
         trainer.on_train_start(args, FakeAccelerator(), StubNetwork(), None, None)
+
+
+def test_on_post_optimizer_step_lerps_only_on_sync():
+    trainer = Krea2SelfFlowNetworkTrainer()
+    trainer.rep_proj = torch.nn.Linear(4, 4)
+    args = make_args(ema_decay=0.9)
+    net = StubNetwork()
+    trainer.on_train_start(args, FakeAccelerator(), net, None, None)
+
+    net.lora_w.data.fill_(2.0)
+    trainer.on_post_optimizer_step(args, FakeAccelerator(), net, None, sync_gradients=False, global_step=1)
+    assert torch.equal(trainer.ema_lora_state["lora_w"], torch.ones(4))  # unchanged
+
+    trainer.on_post_optimizer_step(args, FakeAccelerator(), net, None, sync_gradients=True, global_step=1)
+    assert torch.allclose(trainer.ema_lora_state["lora_w"], torch.full((4,), 1.1))
+
+
+def test_extra_metadata_reports_self_flow_keys():
+    trainer = Krea2SelfFlowNetworkTrainer()
+    args = make_args(student_feature_layer=0, teacher_feature_layer=2)
+    metadata = trainer.extra_metadata(args)
+    assert metadata["ss_self_flow"] is True
+    assert metadata["ss_self_flow_mask_ratio"] == args.mask_ratio
+
+
+def test_extra_metadata_empty_without_self_flow():
+    trainer = Krea2SelfFlowNetworkTrainer()
+    args = make_args(self_flow=False)
+    assert trainer.extra_metadata(args) == {}
+
+
+def test_extra_step_logs_drains_self_flow_logs():
+    trainer = Krea2SelfFlowNetworkTrainer()
+    args = make_args()
+    trainer._self_flow_logs = {"self_flow/gamma": 0.8}
+    assert trainer.extra_step_logs(args, {}) == {"self_flow/gamma": 0.8}
+
+
+def test_extra_step_logs_empty_without_self_flow():
+    trainer = Krea2SelfFlowNetworkTrainer()
+    args = make_args(self_flow=False)
+    trainer._self_flow_logs = {"self_flow/gamma": 0.8}
+    assert trainer.extra_step_logs(args, {}) == {}
