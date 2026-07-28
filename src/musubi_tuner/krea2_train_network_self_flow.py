@@ -180,6 +180,88 @@ def effective_gamma(gamma: float, global_step: int, warmup_steps: int) -> float:
 # endregion self-flow math helpers
 
 
+from typing import Optional
+
+from musubi_tuner.krea2.krea2_mmdit import temb
+
+
+class PerTokenModulationController:
+    """Reroutes K2's modulation path to per-token timesteps via one forward
+    hook plus one instance-attribute monkeypatch.
+
+    Verified mechanism (see docs/superpowers/specs/2026-07-27-krea2-self-flow-design.md):
+    ``model.tmlp``'s output is (B, 1, features) — the middle "1" is a global
+    token axis that nn.Linear/GELU leave untouched all the way through
+    ``tproj`` and into every ``SingleStreamBlock``'s modulation (a pure
+    elementwise add, no shape assumptions). Hooking ``tmlp`` to expand that
+    axis to (B, N, features) is therefore sufficient for every block.
+
+    The final layer is the exception: ``LastLayer.modulation``
+    (``SimpleModulation``) does ``vec + rearrange(self.lin, "two d -> 1 two d")``,
+    which only broadcasts when vec's middle dim is 1 or 2 — with real N this
+    raises inside the original forward, before any ``register_forward_hook``
+    could override the return value. So instead of a hook, the modulation
+    submodule's bound ``forward`` method is replaced at the instance level
+    (not the class, not the source file) with an equivalent elementwise
+    computation that works for any leading shape.
+
+    Install on the raw (unwrapped) model before accelerator.prepare.
+    """
+
+    def __init__(self) -> None:
+        self._handles: list = []
+        self._tau: Optional[torch.Tensor] = None
+        self._tdim: Optional[int] = None
+        self._last_mod: Optional[torch.nn.Module] = None
+        self._orig_last_mod_forward = None
+
+    def install(self, model) -> None:
+        if not hasattr(model, "tmlp"):
+            raise AttributeError(
+                "K2 model has no module 'tmlp' — upstream may have renamed it; "
+                "the Self-Flow per-token hooks need updating."
+            )
+        self._tdim = model.config.tdim
+        self._handles.append(model.tmlp.register_forward_hook(self._tmlp_hook))
+
+        self._last_mod = model.last.modulation
+        self._orig_last_mod_forward = self._last_mod.forward
+        self._last_mod.forward = self._last_mod_forward
+
+    def remove(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+        if self._last_mod is not None:
+            self._last_mod.forward = self._orig_last_mod_forward
+            self._last_mod = None
+            self._orig_last_mod_forward = None
+
+    def stage(self, tau: torch.Tensor) -> None:
+        """Arm the hook for the next forward. tau (B, N), model scale [0, 1]."""
+        self._tau = tau
+
+    def clear(self) -> None:
+        self._tau = None
+
+    def _tmlp_hook(self, module, inputs, output):
+        if self._tau is None:
+            return None
+        B, N = self._tau.shape
+        emb = temb(self._tau.reshape(-1), self._tdim, device=output.device, dtype=output.dtype)
+        emb = emb.reshape(B * N, self._tdim)
+        # module.forward (not module.__call__): bypasses hooks, so no recursion
+        out = module.forward(emb)
+        return out.reshape(B, N, -1)
+
+    def _last_mod_forward(self, vec):
+        if self._tau is None:
+            return self._orig_last_mod_forward(vec)
+        scale = vec + self._last_mod.lin[0]
+        shift = vec + self._last_mod.lin[1]
+        return scale, shift
+
+
 class Krea2SelfFlowNetworkTrainer(Krea2NetworkTrainer):
     pass
 
