@@ -729,6 +729,31 @@ class Krea2SelfFlowNetworkTrainer(Krea2NetworkTrainer):
             "ss_self_flow_teacher_mismatch_ratio": args.self_flow_teacher_mismatch_ratio,
         }
 
+    def on_before_sample_images(
+        self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype
+    ) -> None:
+        """Compose Krea2NetworkTrainer's RAW->Turbo base-weight swap (if
+        --turbo_dit) with Self-Flow's student->EMA network-weight swap.
+        These touch different objects (transformer base weights vs. LoRA
+        network weights) so they don't conflict, but both must run."""
+        super().on_before_sample_images(accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype)
+        if not args.self_flow or self.ema_lora_state is None:
+            return
+        network = accelerator.unwrap_model(network)
+        self._saved_student_state = {k: v.clone() for k, v in network.state_dict().items()}
+        network.load_state_dict(self.ema_lora_state)
+
+    def on_after_sample_images(
+        self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype
+    ) -> None:
+        """Reverse in LIFO order: restore student LoRA weights first, then
+        let Krea2NetworkTrainer restore RAW base weights."""
+        if args.self_flow and self.ema_lora_state is not None and self._saved_student_state is not None:
+            network = accelerator.unwrap_model(network)
+            network.load_state_dict(self._saved_student_state)
+            self._saved_student_state = None
+        super().on_after_sample_images(accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype)
+
     def extra_step_logs(self, args: argparse.Namespace, logs: dict) -> dict:
         """Drain per-step Self-Flow metrics into the trainer's log payload."""
         if not args.self_flow:
