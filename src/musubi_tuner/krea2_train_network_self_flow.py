@@ -62,6 +62,48 @@ def reconstruct_noisy_input(latents: torch.Tensor, noise: torch.Tensor, timestep
     return (1 - t_exp) * latents + t_exp * noise
 
 
+def apply_per_token_mask(
+    noisy_input_student: torch.Tensor,
+    noisy_input_teacher: torch.Tensor,
+    mask_ratio: "float | torch.Tensor",
+    patch: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-patch-token masking (paper Eq. 4-5), K2-specific.
+
+    Unlike FLUX.2 (patch=1, one token per latent pixel), K2 groups
+    ``patch x patch`` latent pixels into one DiT token before the DiT ever
+    sees it. The random mask/mismatch draw must therefore happen once per
+    DiT token (shape (B, h_*w_)), not once per latent pixel — otherwise the
+    mask used here (pixel-space) and the mask used for the modulation hook
+    (token-space) would disagree. Each token's draw is expanded to its full
+    ``patch x patch`` pixel block via repeat_interleave before selecting
+    between student/teacher.
+
+    ``noisy_input_student``/``noisy_input_teacher`` are (B, C, 1, H, W) —
+    K2 always has a single-frame T=1 axis.
+
+    Returns (masked_input, mask_tok) with mask_tok (B, h_*w_) bool,
+    True = masked (this sample's patch-token takes the teacher/cleaner value).
+    """
+    B, C, T, H, W = noisy_input_student.shape
+    assert T == 1, f"K2 expects single-frame latents, got T={T}"
+    h_tok, w_tok = H // patch, W // patch
+    N = h_tok * w_tok
+
+    ratio = torch.as_tensor(mask_ratio, dtype=torch.float32, device=device)
+    if ratio.ndim == 0:
+        ratio = ratio.expand(B)
+    mask_tok = torch.rand(B, N, device=device) < ratio.unsqueeze(1)  # (B, N)
+
+    mask_grid = mask_tok.view(B, 1, 1, h_tok, w_tok)
+    mask_pixel = mask_grid.repeat_interleave(patch, dim=3).repeat_interleave(patch, dim=4)
+    mask_pixel = mask_pixel.expand(B, C, T, H, W)
+
+    masked_input = torch.where(mask_pixel, noisy_input_teacher, noisy_input_student)
+    return masked_input, mask_tok
+
+
 def build_per_token_timestep_map(
     timesteps_teacher: torch.Tensor,
     timesteps_student: torch.Tensor,
