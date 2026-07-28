@@ -22,12 +22,16 @@ Internal extension point — no API stability guarantees.
 
 import argparse
 import logging
+import os
+from typing import Optional
 
 import torch
 from accelerate import Accelerator
+from safetensors.torch import load_file, save_file
 
 from musubi_tuner.hv_train_network import setup_parser_common, read_config_from_file
 from musubi_tuner.krea2_train_network import Krea2NetworkTrainer, krea2_setup_parser
+from musubi_tuner.utils import huggingface_utils
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -180,8 +184,6 @@ def effective_gamma(gamma: float, global_step: int, warmup_steps: int) -> float:
 # endregion self-flow math helpers
 
 
-from typing import Optional
-
 from musubi_tuner.krea2.krea2_mmdit import temb
 
 
@@ -319,10 +321,231 @@ class BlockFeatureExtractor:
 
 
 class Krea2SelfFlowNetworkTrainer(Krea2NetworkTrainer):
-    pass
+    """K2 + Self-Flow trainer.
+
+    Owned state (set during the relevant lifecycle seams, used across steps):
+    - ``self.rep_proj``: representation projection head (paper Eq. 6).
+    - ``self.ema_lora_state``: EMA snapshot of LoRA weights (the "teacher").
+    - ``self._feature_extractor``: BlockFeatureExtractor, installed in
+      ``on_transformer_loaded``.
+    - ``self._modulation_controller``: PerTokenModulationController, installed
+      in ``on_transformer_loaded``.
+    - ``self._self_flow_logs``: per-step state metrics drained by
+      ``extra_step_logs``.
+    - ``self._saved_student_state``: snapshot of student LoRA weights while
+      EMA weights are swapped in for sampling.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rep_proj: Optional[torch.nn.Module] = None
+        self.ema_lora_state: Optional[dict] = None
+        self._feature_extractor: Optional[BlockFeatureExtractor] = None
+        self._modulation_controller: Optional[PerTokenModulationController] = None
+        self._self_flow_logs: dict = {}
+        self._saved_student_state: Optional[dict] = None
+
+    def handle_model_specific_args(self, args: argparse.Namespace) -> None:
+        super().handle_model_specific_args(args)
+        if args.self_flow:
+            if (
+                args.student_feature_layer is not None
+                and args.teacher_feature_layer is not None
+                and args.student_feature_layer >= args.teacher_feature_layer
+            ):
+                raise ValueError(
+                    f"--student_feature_layer ({args.student_feature_layer}) must be less than "
+                    f"--teacher_feature_layer ({args.teacher_feature_layer})."
+                )
+            if not 0.0 <= args.mask_ratio <= 0.5:
+                raise ValueError(f"--mask_ratio ({args.mask_ratio}) must be in [0, 0.5] (paper constraint R_M <= 0.5)")
+            num_buckets = getattr(args, "num_timestep_buckets", None)
+            if num_buckets is not None and num_buckets >= 2:
+                raise ValueError(
+                    f"--num_timestep_buckets ({num_buckets}) is incompatible with --self_flow: "
+                    "bucketed timestep sampling forces both self-flow draws to the same bucket "
+                    "value (t == s), collapsing the dual-timestep schedule to a no-op. "
+                    "Unset --num_timestep_buckets when using --self_flow."
+                )
+            if getattr(args, "compile", False):
+                logger.warning("--compile with --self_flow: forward hooks cause graph breaks; expect reduced compile benefit.")
+
+    def extra_trainable_params(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network,
+        transformer,
+        trainable_params: list,
+    ) -> list:
+        trainable_params = super().extra_trainable_params(args, accelerator, network, transformer, trainable_params)
+        if not args.self_flow:
+            return trainable_params
+
+        hidden_size = accelerator.unwrap_model(transformer).config.features
+        self.rep_proj = torch.nn.Sequential(
+            torch.nn.Linear(hidden_size, hidden_size),
+            torch.nn.GELU(),
+            torch.nn.Linear(hidden_size, hidden_size),
+        )
+        if args.network_weights_proj is not None:
+            proj_state = load_file(args.network_weights_proj)
+            self.rep_proj.load_state_dict(proj_state)
+            accelerator.print(f"loaded projection head weights from {args.network_weights_proj}")
+
+        if trainable_params:
+            trainable_params[0]["params"] = list(trainable_params[0]["params"]) + list(self.rep_proj.parameters())
+        else:
+            trainable_params = [{"params": list(self.rep_proj.parameters())}]
+        return trainable_params
+
+    def on_transformer_loaded(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer,
+    ) -> None:
+        super().on_transformer_loaded(args, accelerator, transformer)
+        if not args.self_flow:
+            return
+
+        num_blocks = len(transformer.blocks)
+        if args.student_feature_layer is None:
+            args.student_feature_layer = max(0, int(num_blocks * 0.3))
+        if args.teacher_feature_layer is None:
+            args.teacher_feature_layer = min(num_blocks - 1, int(num_blocks * 0.7))
+        if args.student_feature_layer >= args.teacher_feature_layer:
+            raise ValueError(
+                f"--student_feature_layer ({args.student_feature_layer}) must be less than "
+                f"--teacher_feature_layer ({args.teacher_feature_layer})."
+            )
+
+        self._modulation_controller = PerTokenModulationController()
+        self._modulation_controller.install(transformer)
+        self._feature_extractor = BlockFeatureExtractor()
+        self._feature_extractor.install(transformer, [args.student_feature_layer, args.teacher_feature_layer])
+        logger.info(
+            f"Self-Flow hooks installed: student_layer={args.student_feature_layer}, "
+            f"teacher_layer={args.teacher_feature_layer} (of {num_blocks} blocks)"
+        )
+
+    def on_train_start(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network,
+        transformer,
+        optimizer,
+    ) -> None:
+        super().on_train_start(args, accelerator, network, transformer, optimizer)
+        if not args.self_flow:
+            return
+
+        unwrapped_nw = accelerator.unwrap_model(network)
+        self.ema_lora_state = {k: v.detach().clone() for k, v in unwrapped_nw.state_dict().items()}
+        if args.network_weights_ema is not None:
+            if args.network_weights is None:
+                raise ValueError("--network_weights_ema requires --network_weights to be set")
+            unwrapped_nw = accelerator.unwrap_model(network)
+            info = unwrapped_nw.load_weights(args.network_weights_ema)
+            accelerator.print(f"load EMA network weights from {args.network_weights_ema}: {info}")
+            self.ema_lora_state = {k: v.detach().clone() for k, v in unwrapped_nw.state_dict().items()}
+            unwrapped_nw.load_weights(args.network_weights)
+
+        self.rep_proj = accelerator.prepare(self.rep_proj)
+
+        if args.self_flow_teacher_coupling_decay != "constant":
+            logger.warning(
+                "self_flow_teacher_coupling_decay schedules are not implemented in this extension yet; "
+                "using constant coupling probability."
+            )
+        logger.info(
+            f"Self-Flow enabled: gamma={args.self_flow_gamma}, mask_ratio={args.mask_ratio}, "
+            f"ema_decay={args.ema_decay}, student_layer={args.student_feature_layer}, "
+            f"teacher_layer={args.teacher_feature_layer}"
+        )
 
 
 def self_flow_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Self-Flow-specific CLI arguments. Mirrors flux_2_train_network_self_flow.py's additions."""
+    parser.add_argument(
+        "--self_flow",
+        action="store_true",
+        help="Enable Self-Flow training (dual-timestep scheduling + representation alignment).",
+    )
+    parser.add_argument(
+        "--self_flow_gamma",
+        type=float,
+        default=0.8,
+        help="Weight for representation alignment loss L_rep (paper Eq. 7). 0 disables L_rep.",
+    )
+    parser.add_argument(
+        "--self_flow_gamma_warmup_steps",
+        type=int,
+        default=0,
+        help="Linearly ramp gamma from 0 to --self_flow_gamma over this many steps. 0 disables warmup.",
+    )
+    parser.add_argument(
+        "--mask_ratio",
+        type=float,
+        default=0.25,
+        help="Token mask ratio for dual-timestep scheduling (paper Eq. 4, R_M <= 0.5).",
+    )
+    parser.add_argument(
+        "--ema_decay",
+        type=float,
+        default=0.999,
+        help="EMA decay for the Self-Flow teacher LoRA weights.",
+    )
+    parser.add_argument(
+        "--student_feature_layer",
+        type=int,
+        default=None,
+        help="Global block index for student feature extraction (l in paper, must be < teacher_feature_layer). Recommended ~0.3 * num_blocks.",
+    )
+    parser.add_argument(
+        "--teacher_feature_layer",
+        type=int,
+        default=None,
+        help="Global block index for teacher feature extraction (k in paper, must be > student_feature_layer). Recommended ~0.7 * num_blocks.",
+    )
+    parser.add_argument(
+        "--self_flow_teacher_coupling_prob",
+        type=float,
+        default=0.0,
+        help="Per-step gate probability for applying timestep mismatch on masked patches. 0 disables mismatch.",
+    )
+    parser.add_argument(
+        "--self_flow_teacher_coupling_decay",
+        type=str,
+        default="constant",
+        choices=["constant", "cosine", "linear", "rex"],
+        help="Decay schedule for --self_flow_teacher_coupling_prob.",
+    )
+    parser.add_argument(
+        "--self_flow_teacher_coupling_decay_steps",
+        type=int,
+        default=None,
+        help="Steps over which to decay coupling prob to 0. Defaults to max_train_steps.",
+    )
+    parser.add_argument(
+        "--self_flow_teacher_mismatch_ratio",
+        type=float,
+        default=1.0,
+        help="When the coupling gate fires, fraction of masked patches receiving the timestep mismatch.",
+    )
+    parser.add_argument(
+        "--network_weights_ema",
+        type=str,
+        default=None,
+        help="Pretrained EMA (teacher) weights for resumption. Requires --network_weights.",
+    )
+    parser.add_argument(
+        "--network_weights_proj",
+        type=str,
+        default=None,
+        help="Pretrained projection head weights for resumption.",
+    )
     return parser
 
 
