@@ -26,21 +26,26 @@ def _build_forward_inputs(model, B=1, H=8, W=8, n_txt=3):
 def test_pass_through_when_not_staged(tiny_k2_model):
     torch.manual_seed(0)
     img, context, pos, mask, imglen, N = _build_forward_inputs(tiny_k2_model)
-    baseline = tiny_k2_model(img=img, context=context, t=torch.rand(1), pos=pos, mask=mask)
+    t = torch.rand(1)
+
+    # tiny_k2_model is already .eval()'d (see conftest_k2_self_flow.py), so there is
+    # no dropout/stochastic-layer randomness between calls: reusing the exact same
+    # input tensors across all three forward passes makes bit-identity comparisons
+    # meaningful (torch.equal, not just shape).
+    baseline = tiny_k2_model(img=img, context=context, t=t, pos=pos, mask=mask)
 
     controller = PerTokenModulationController()
     controller.install(tiny_k2_model)
-    torch.manual_seed(0)
-    img2, context2, pos2, mask2, _, _ = _build_forward_inputs(tiny_k2_model)
-    with_hooks = tiny_k2_model(img=img2, context=context2, t=torch.rand(1), pos=pos2, mask=mask2)
-    controller.remove()
+    with_hooks_unstaged = tiny_k2_model(img=img, context=context, t=t, pos=pos, mask=mask)
+    assert torch.equal(with_hooks_unstaged, baseline), (
+        "installing the controller without staging must be a bit-identical pass-through"
+    )
 
-    # NOTE: torch.rand(1) advances the RNG differently across the two calls above
-    # since _build_forward_inputs also draws random tensors; the point of this
-    # test is just that install()/remove() do not change output shape or crash,
-    # and that removing restores the original bound forward method.
-    assert with_hooks.shape == baseline.shape
-    assert tiny_k2_model.last.modulation.forward.__func__ is not None
+    controller.remove()
+    after_remove = tiny_k2_model(img=img, context=context, t=t, pos=pos, mask=mask)
+    assert torch.equal(after_remove, baseline), (
+        "remove() must restore the original bound forward method exactly"
+    )
 
 
 def test_staged_produces_per_token_variation(tiny_k2_model):

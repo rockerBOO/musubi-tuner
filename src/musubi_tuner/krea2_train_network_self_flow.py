@@ -454,6 +454,19 @@ class Krea2SelfFlowNetworkTrainer(Krea2NetworkTrainer):
 
         self.rep_proj = accelerator.prepare(self.rep_proj)
 
+        if (
+            getattr(args, "resume", None) is not None
+            and args.network_weights_ema is None
+            and args.network_weights_proj is None
+        ):
+            logger.warning(
+                "Resuming training (--resume) with Self-Flow enabled, but neither --network_weights_ema nor "
+                "--network_weights_proj was supplied: the EMA teacher will be silently re-snapshotted from the "
+                "resumed student weights (degenerating L_rep until the EMA drifts again), and the projection "
+                "head will be randomly re-initialized. Pass --network_weights_ema/--network_weights_proj to "
+                "resume the teacher and projection head from saved companion files."
+            )
+
         if args.self_flow_teacher_coupling_decay != "constant":
             logger.warning(
                 "self_flow_teacher_coupling_decay schedules are not implemented in this extension yet; "

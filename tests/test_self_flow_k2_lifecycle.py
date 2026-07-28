@@ -138,3 +138,55 @@ def test_extra_step_logs_empty_without_self_flow():
     args = make_args(self_flow=False)
     trainer._self_flow_logs = {"self_flow/gamma": 0.8}
     assert trainer.extra_step_logs(args, {}) == {}
+
+
+def _resume_warning_fired(caplog):
+    return any(
+        "resume" in rec.message.lower() and "ema" in rec.message.lower()
+        for rec in caplog.records
+        if rec.name == "musubi_tuner.krea2_train_network_self_flow"
+    )
+
+
+def test_on_train_start_warns_on_resume_without_companion_weights(caplog):
+    trainer = Krea2SelfFlowNetworkTrainer()
+    trainer.rep_proj = torch.nn.Linear(4, 4)
+    args = make_args(resume="/some/path/state", network_weights_ema=None, network_weights_proj=None)
+    with caplog.at_level("WARNING", logger="musubi_tuner.krea2_train_network_self_flow"):
+        trainer.on_train_start(args, FakeAccelerator(), StubNetwork(), None, None)
+    assert _resume_warning_fired(caplog)
+
+
+def test_on_train_start_no_resume_warning_when_network_weights_ema_set(caplog):
+    trainer = Krea2SelfFlowNetworkTrainer()
+    trainer.rep_proj = torch.nn.Linear(4, 4)
+    args = make_args(
+        resume="/some/path/state",
+        network_weights_ema="ema.safetensors",
+        network_weights="student.safetensors",
+        network_weights_proj=None,
+    )
+    net = StubNetwork()
+    net._weight_registry["ema.safetensors"] = 3.0
+    net._weight_registry["student.safetensors"] = 1.0
+    with caplog.at_level("WARNING", logger="musubi_tuner.krea2_train_network_self_flow"):
+        trainer.on_train_start(args, FakeAccelerator(), net, None, None)
+    assert not _resume_warning_fired(caplog)
+
+
+def test_on_train_start_no_resume_warning_when_network_weights_proj_set(caplog):
+    trainer = Krea2SelfFlowNetworkTrainer()
+    trainer.rep_proj = torch.nn.Linear(4, 4)
+    args = make_args(resume="/some/path/state", network_weights_ema=None, network_weights_proj="proj.safetensors")
+    with caplog.at_level("WARNING", logger="musubi_tuner.krea2_train_network_self_flow"):
+        trainer.on_train_start(args, FakeAccelerator(), StubNetwork(), None, None)
+    assert not _resume_warning_fired(caplog)
+
+
+def test_on_train_start_no_resume_warning_when_resume_not_set(caplog):
+    trainer = Krea2SelfFlowNetworkTrainer()
+    trainer.rep_proj = torch.nn.Linear(4, 4)
+    args = make_args(resume=None, network_weights_ema=None, network_weights_proj=None)
+    with caplog.at_level("WARNING", logger="musubi_tuner.krea2_train_network_self_flow"):
+        trainer.on_train_start(args, FakeAccelerator(), StubNetwork(), None, None)
+    assert not _resume_warning_fired(caplog)
