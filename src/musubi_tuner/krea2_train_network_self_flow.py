@@ -465,6 +465,71 @@ class Krea2SelfFlowNetworkTrainer(Krea2NetworkTrainer):
             f"teacher_layer={args.teacher_feature_layer}"
         )
 
+    def call_dit(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer,
+        latents: torch.Tensor,
+        batch: dict[str, torch.Tensor],
+        noise: torch.Tensor,
+        noisy_model_input: torch.Tensor,
+        timesteps: torch.Tensor,
+        network_dtype: torch.dtype,
+        **kwargs,
+    ):
+        """Extends Krea2NetworkTrainer.call_dit.
+
+        Recognised kwargs:
+        - ``hidden_features`` (bool): when True, return captured features in
+          ``DiTOutput.extra["features"]`` (drained from ``self._feature_extractor``).
+        - ``feature_layer`` (int): which registered layer's output to return.
+        - ``per_token_timesteps`` (Tensor): (B, imglen) per-image-token timestep
+          map for dual-timestep conditioning. Staged into
+          ``self._modulation_controller`` before the forward and cleared after.
+        """
+        hidden_features = kwargs.pop("hidden_features", False)
+        feature_layer = kwargs.pop("feature_layer", None)
+        per_token_timesteps = kwargs.pop("per_token_timesteps", None)
+
+        if not hidden_features and per_token_timesteps is None:
+            return super().call_dit(
+                args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype, **kwargs
+            )
+
+        model = accelerator.unwrap_model(transformer)
+        patch = model.config.patch
+        nmi = noisy_model_input.squeeze(2)
+        _, _, lat_h, lat_w = nmi.shape
+        imglen = (lat_h // patch) * (lat_w // patch)
+
+        if per_token_timesteps is not None:
+            vl_embed = batch["krea2_vl_embed"]
+            max_len = max(x.shape[0] for x in vl_embed)
+            fulllen = imglen + max_len
+            padlen = (-fulllen) % 256
+            N = fulllen + padlen
+            B = per_token_timesteps.shape[0]
+            # model scale: base call_dit divides 1D timesteps by 1000; mirror that here
+            tau_img = per_token_timesteps.to(device=accelerator.device) / 1000.0
+            tau_global = (timesteps.to(device=accelerator.device) / 1000.0).unsqueeze(1).expand(B, N - imglen)
+            tau_full = torch.cat([tau_img, tau_global], dim=1)
+            self._modulation_controller.stage(tau_full)
+        if hidden_features:
+            self._feature_extractor.arm(feature_layer, imglen)
+        features = None
+        try:
+            output = super().call_dit(
+                args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype, **kwargs
+            )
+        finally:
+            self._modulation_controller.clear()
+            if hidden_features:
+                features = self._feature_extractor.drain()
+        if hidden_features:
+            output.extra["features"] = features
+        return output
+
 
 def self_flow_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Self-Flow-specific CLI arguments. Mirrors flux_2_train_network_self_flow.py's additions."""
