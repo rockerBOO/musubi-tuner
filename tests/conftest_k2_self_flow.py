@@ -52,5 +52,5 @@ def make_k2_batch(B=2, H=8, W=8, n_txt=3, patch=2, txtlayers=1, txtdim=32, seed=
     latents = torch.randn(B, channels, 1, H, W)
     noise = torch.randn_like(latents)
     vl_embed = [torch.randn(n_txt, txtlayers, txtdim) for _ in range(B)]
-    batch = {"krea2_vl_embed": vl_embed, "timesteps": None}
+    batch = {"latents": latents, "krea2_vl_embed": vl_embed, "timesteps": None}
     return batch, latents, noise
