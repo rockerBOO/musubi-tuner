@@ -109,11 +109,14 @@ def test_gradient_checkpointing_with_fp4_te_survives_recompute():
     x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
     def fn(x):
-        with fp4_autocast(True):
-            return model.qkv(x)
+        return model.qkv(x)
 
-    out = torch.utils.checkpoint.checkpoint(
-        fn, x, use_reentrant=False, context_fn=lambda: fp4_checkpoint_context_fn(True)
-    )
+    # Mirrors call_dit: fp4_autocast wraps only the initial checkpoint call, exits before
+    # backward() runs. context_fn is the ONLY thing that can reactivate it for recompute --
+    # without a working context_fn, this raises torch.utils.checkpoint.CheckpointError.
+    with fp4_autocast(True):
+        out = torch.utils.checkpoint.checkpoint(
+            fn, x, use_reentrant=False, context_fn=lambda: fp4_checkpoint_context_fn(True)
+        )
     out.sum().backward()
     assert x.grad is not None
