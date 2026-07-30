@@ -32,6 +32,7 @@ from musubi_tuner.hv_train_network import (
 )
 from musubi_tuner.krea2 import krea2_utils
 from musubi_tuner.krea2 import krea2_sampling
+from musubi_tuner.modules import te_fp4_utils
 from musubi_tuner.qwen_image import qwen_image_utils
 from musubi_tuner.utils import model_utils
 
@@ -82,6 +83,15 @@ class Krea2NetworkTrainer(NetworkTrainer):
             raise ValueError("--convrot_int8 is not supported together with --turbo_dit yet; omit one of them.")
         if args.convrot_int8_bwd == "int8" and not args.convrot_int8:
             raise ValueError("--convrot_int8_bwd int8 requires --convrot_int8.")
+        # NVFP4 via Transformer Engine is a third, mutually exclusive quantization scheme.
+        if args.fp4_te and (args.fp8_base or args.fp8_scaled or args.convrot_int8):
+            raise ValueError(
+                "--fp4_te cannot be combined with --fp8_base/--fp8_scaled/--convrot_int8: choose one quantization."
+            )
+        # Turbo sampling swaps base weights externally (see the block-swap comment below); not
+        # validated yet against a live te.Linear-swapped model.
+        if args.fp4_te and args.turbo_dit:
+            raise ValueError("--fp4_te is not supported together with --turbo_dit yet; omit one of them.")
         # RAW-train / Turbo-sample: the recommended K2 LoRA workflow is to train on the RAW
         # checkpoint and run inference on the distilled Turbo. --turbo_dit makes sample
         # generation during training swap the base weights to Turbo (LoRA, hooked on the live
@@ -408,6 +418,7 @@ class Krea2NetworkTrainer(NetworkTrainer):
             split_attn=split_attn,
             convrot_int8=args.convrot_int8,
             convrot_int8_bwd=args.convrot_int8_bwd,
+            fp4_te=args.fp4_te,
         )
         return model
 
@@ -483,7 +494,7 @@ class Krea2NetworkTrainer(NetworkTrainer):
             img_tokens.requires_grad_(True)
             context.requires_grad_(True)
 
-        with accelerator.autocast():
+        with accelerator.autocast(), te_fp4_utils.fp4_autocast(args.fp4_te):
             model_pred = model(img=img_tokens, context=context, t=t, pos=pos, mask=mask)  # (B, h*w, c*ph*pw)
 
         # unpatchify to latent space (B, C, 1, H, W)
@@ -519,6 +530,16 @@ def krea2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
         choices=["bf16", "int8"],
         help="backward mode for --convrot_int8. bf16 (default): transient dequantized matmul, most accurate. "
         "int8: reuse the fused int8 GEMM for grad_x (faster, quantizes gradients slightly, requires triton).",
+    )
+    parser.add_argument(
+        "--fp4_te",
+        action="store_true",
+        help="use Transformer Engine's NVFP4BlockScaling recipe for the DiT base weights "
+        "(alternative to --fp8_scaled/--convrot_int8; cannot be combined with either). Swaps "
+        "per-block Linears for te.Linear at load time and wraps the DiT forward in "
+        "te.autocast(NVFP4BlockScaling). Requires transformer_engine installed in the venv "
+        "(not a project dependency — see notes/te-fp4-build-blackwell.md). No VRAM reduction: "
+        "TE keeps a full bf16 master weight and quantizes JIT per forward call.",
     )
     parser.add_argument(
         "--text_encoder",

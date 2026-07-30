@@ -62,3 +62,52 @@ def test_load_krea2_dit_mutual_exclusion_fp4_te_convrot(tmp_path):
             convrot_int8=True,
             fp4_te=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# trainer flag validation
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace
+
+
+def _trainer_args(**overrides):
+    base = dict(
+        fp8_base=False,
+        fp8_scaled=False,
+        convrot_int8=False,
+        convrot_int8_bwd="bf16",
+        fp4_te=False,
+        turbo_dit=None,
+        turbo_dit_cache=False,
+        blocks_to_swap=0,
+        sample_prompts=None,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _handle_args(args):
+    from musubi_tuner.krea2_train_network import Krea2NetworkTrainer
+
+    trainer = Krea2NetworkTrainer()
+    trainer.handle_model_specific_args(args)
+
+
+def test_trainer_rejects_fp4_te_with_fp8():
+    with pytest.raises(ValueError, match="fp4_te"):
+        _handle_args(_trainer_args(fp4_te=True, fp8_base=True, fp8_scaled=True))
+
+
+def test_trainer_rejects_fp4_te_with_convrot():
+    with pytest.raises(ValueError, match="fp4_te"):
+        _handle_args(_trainer_args(fp4_te=True, convrot_int8=True))
+
+
+def test_trainer_rejects_fp4_te_with_turbo():
+    with pytest.raises(ValueError, match="turbo"):
+        _handle_args(_trainer_args(fp4_te=True, turbo_dit="turbo.safetensors"))
+
+
+def test_trainer_accepts_fp4_te_alone():
+    _handle_args(_trainer_args(fp4_te=True))
