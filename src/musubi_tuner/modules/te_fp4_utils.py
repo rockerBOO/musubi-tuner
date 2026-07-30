@@ -76,3 +76,21 @@ def fp4_autocast(enabled: bool):
 
     fp4_recipe = recipe.NVFP4BlockScaling(disable_stochastic_rounding=True)
     return tep.autocast(enabled=True, recipe=fp4_recipe)
+
+
+def fp4_checkpoint_context_fn(enabled: bool):
+    """context_fn for torch.utils.checkpoint.checkpoint(..., use_reentrant=False).
+
+    TE's autocast is global state (FP8GlobalStateManager), not plumbed through
+    PyTorch's own autocast save/restore that torch.utils.checkpoint understands.
+    Without this, a checkpointed block's recompute pass (which runs later, during
+    backward(), outside whatever `with fp4_autocast(...)` block wrapped the original
+    forward) executes with FP4 autocast off -- a different code path through
+    te.Linear.forward that saves a different number of tensors than the original
+    FP4-autocasted forward, raising torch.utils.checkpoint.CheckpointError.
+
+    The forward pass already runs correctly under the caller's ambient
+    fp4_autocast context, so only the recompute context needs to reactivate it;
+    the forward slot is a no-op to avoid a redundant nested autocast.
+    """
+    return contextlib.nullcontext(), fp4_autocast(enabled)

@@ -148,6 +148,9 @@ def load_krea2_dit(
 
     if fp4_te:
         swap_linears_to_te(dit, KREA2_FP8_OPTIMIZATION_TARGET_KEYS, KREA2_FP8_OPTIMIZATION_EXCLUDE_KEYS)
+        # Lets gradient checkpointing's recompute pass reactivate FP4 autocast
+        # (see modules.te_fp4_utils.fp4_checkpoint_context_fn).
+        dit.fp4_te = True
 
     return dit
 

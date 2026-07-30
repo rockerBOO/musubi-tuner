@@ -18,6 +18,7 @@ from einops import rearrange
 from torch import Tensor
 
 from musubi_tuner.modules.attention import AttentionParams, attention as common_attention
+from musubi_tuner.modules.te_fp4_utils import fp4_checkpoint_context_fn
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, create_offloader
 
 
@@ -346,6 +347,10 @@ class SingleStreamDiT(nn.Module):
         self.gradient_checkpointing = False
         self.blocks_to_swap = 0
         self.offloader = None
+        # Set externally (krea2_utils.load_krea2_dit) after swap_linears_to_te swaps this
+        # model's block Linears for te.Linear -- lets gradient checkpointing's recompute
+        # pass reactivate FP4 autocast (see fp4_checkpoint_context_fn).
+        self.fp4_te = False
 
     def enable_gradient_checkpointing(self, cpu_offload: bool = False):
         # cpu_offload is accepted for interface parity; not implemented for K2 yet.
@@ -439,7 +444,15 @@ class SingleStreamDiT(nn.Module):
                 self.offloader.wait_for_block(index)
 
             if self.gradient_checkpointing and self.training:
-                combined = torch.utils.checkpoint.checkpoint(block, combined, tvec, freqs, attn_params, use_reentrant=False)
+                combined = torch.utils.checkpoint.checkpoint(
+                    block,
+                    combined,
+                    tvec,
+                    freqs,
+                    attn_params,
+                    use_reentrant=False,
+                    context_fn=lambda: fp4_checkpoint_context_fn(self.fp4_te),
+                )
             else:
                 combined = block(combined, tvec, freqs, attn_params)
 
