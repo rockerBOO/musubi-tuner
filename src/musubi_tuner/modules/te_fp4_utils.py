@@ -5,11 +5,12 @@ module a plain nn.Linear with a monkey-patched forward — te.Linear is a differ
 module class with its own parameter layout, so the child module instance is
 replaced outright. This is safe for LoRA-targeting and block-swap's string-based
 class checks: transformer_engine.pytorch.Linear.__name__ == "Linear" too (verified
-in notes/te-fp4-build-blackwell.md / notes/nvfp4-te-implementation.md).
+empirically).
 
 transformer_engine is imported lazily inside these functions so that normal
 (non---fp4_te) runs never need it installed -- it is not a project dependency,
-only present in the dev venv it was built into (see notes/te-fp4-build-blackwell.md).
+only present in venvs it has been built into from source (no prebuilt wheel
+exists for every target GPU/CUDA combination).
 """
 
 import contextlib
@@ -28,7 +29,11 @@ def swap_linears_to_te(module: nn.Module, target_keys: List[str], exclude_keys: 
 
     Scoping matches KREA2_FP8_OPTIMIZATION_TARGET_KEYS / _EXCLUDE_KEYS: a child's
     dotted name must contain any of ``target_keys`` and none of ``exclude_keys``.
-    Weight/bias are copied byte-for-byte (same device/dtype) into the new module.
+    Weight/bias values are copied as-is, but the new te.Linear is always built with
+    params_dtype=torch.bfloat16 regardless of the source Linear's dtype -- NVFP4's
+    random Hadamard transform only supports bfloat16 input, so this is a hard
+    requirement, not a same-dtype copy. copy_() will downcast a non-bfloat16
+    source weight silently.
     """
     import transformer_engine.pytorch as tep
 
@@ -66,7 +71,7 @@ def fp4_autocast(enabled: bool):
     disable_stochastic_rounding=True is required: NVFP4's stochastic-rounding
     gradient quantization path is hardware-gated to sm_100a/sm_103a (datacenter
     Blackwell) and excludes sm_120 (consumer Blackwell, e.g. RTX 50-series) in
-    this TE version -- see notes/te-fp4-build-blackwell.md.
+    this TE version -- confirmed empirically, not documented upstream.
     """
     if not enabled:
         return contextlib.nullcontext()

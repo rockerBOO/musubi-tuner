@@ -8,8 +8,24 @@ import torch.nn as nn
 import torch.utils.checkpoint
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-te = pytest.importorskip("transformer_engine.pytorch", reason="transformer_engine not installed")
 
+
+def _te_available() -> bool:
+    try:
+        import transformer_engine.pytorch  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+# Only the tests that actually exercise transformer_engine (directly, or transitively via
+# fp4_autocast(True)'s lazy import) are gated on this -- the enabled=False no-op guarantees
+# and the exclusivity checks must run everywhere transformer_engine isn't installed too.
+requires_te = pytest.mark.skipif(not _te_available(), reason="transformer_engine not installed")
+
+# te_fp4_utils itself only imports transformer_engine lazily inside functions, so importing
+# it here never requires transformer_engine to be installed.
 from musubi_tuner.modules.te_fp4_utils import fp4_autocast, fp4_checkpoint_context_fn, swap_linears_to_te
 
 
@@ -28,6 +44,7 @@ class _TinyLinearHolder(nn.Module):
 
 
 @requires_cuda
+@requires_te
 def test_swap_linears_to_te_only_touches_targeted_linears():
     model = _TinyBlock().to("cuda", dtype=torch.bfloat16)
     orig_qkv_weight = model.blocks[0].qkv.weight.detach().clone()
@@ -47,6 +64,7 @@ def test_swap_linears_to_te_only_touches_targeted_linears():
 
 
 @requires_cuda
+@requires_te
 def test_swap_linears_to_te_preserves_forward_shape():
     model = _TinyBlock().to("cuda", dtype=torch.bfloat16)
     swap_linears_to_te(model, target_keys=["blocks."], exclude_keys=["norm"])
@@ -61,6 +79,7 @@ def test_fp4_autocast_disabled_is_nullcontext():
 
 
 @requires_cuda
+@requires_te
 def test_fp4_autocast_enabled_engages_fp8_state():
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
 
@@ -75,14 +94,18 @@ def test_fp4_checkpoint_context_fn_disabled_returns_two_nullcontexts():
     assert isinstance(recompute_ctx, contextlib.nullcontext)
 
 
+@requires_te
 def test_fp4_checkpoint_context_fn_forward_slot_is_always_nullcontext():
     # The forward pass already runs under the caller's ambient fp4_autocast context
-    # (see call_dit); only the recompute slot needs to reactivate it.
+    # (see call_dit); only the recompute slot needs to reactivate it. requires_te because
+    # building the recompute slot (fp4_autocast(True)) triggers TE's lazy import even
+    # though this test only inspects the forward slot.
     fwd_ctx, _ = fp4_checkpoint_context_fn(True)
     assert isinstance(fwd_ctx, contextlib.nullcontext)
 
 
 @requires_cuda
+@requires_te
 def test_fp4_checkpoint_context_fn_enabled_recompute_slot_engages_fp8_state():
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
 
@@ -93,6 +116,7 @@ def test_fp4_checkpoint_context_fn_enabled_recompute_slot_engages_fp8_state():
 
 
 @requires_cuda
+@requires_te
 def test_gradient_checkpointing_with_fp4_te_survives_recompute():
     """Reproduces the exact bug this fix addresses: without context_fn reactivating
     FP4 autocast during recompute, torch.utils.checkpoint.CheckpointError is raised

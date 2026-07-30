@@ -147,6 +147,10 @@ def load_krea2_dit(
         dit.load_state_dict(sd, strict=True, assign=True)
 
     if fp4_te:
+        # Note: te.Linear adds an "_extra_state" entry per swapped module to the DiT's
+        # state_dict (TE's own bookkeeping). Harmless for LoRA training (only the network
+        # is saved), but would surface as a strict=True load_state_dict mismatch if this
+        # base state_dict were ever round-tripped elsewhere.
         swap_linears_to_te(dit, KREA2_FP8_OPTIMIZATION_TARGET_KEYS, KREA2_FP8_OPTIMIZATION_EXCLUDE_KEYS)
         # Lets gradient checkpointing's recompute pass reactivate FP4 autocast
         # (see modules.te_fp4_utils.fp4_checkpoint_context_fn).

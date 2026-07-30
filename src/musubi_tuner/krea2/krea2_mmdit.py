@@ -444,6 +444,13 @@ class SingleStreamDiT(nn.Module):
                 self.offloader.wait_for_block(index)
 
             if self.gradient_checkpointing and self.training:
+                # context_fn is only passed when fp4_te is active: torch's checkpoint branches
+                # on context_fn's identity (not behavior) in a couple of places -- passing a
+                # non-default context_fn unconditionally would break
+                # torch.utils.checkpoint.set_checkpoint_debug_enabled(True) and dynamo tracing
+                # for every K2 run, not just fp4_te ones, even though a disabled context_fn is
+                # behaviorally a no-op.
+                ckpt_kwargs = {"context_fn": lambda: fp4_checkpoint_context_fn(True)} if self.fp4_te else {}
                 combined = torch.utils.checkpoint.checkpoint(
                     block,
                     combined,
@@ -451,7 +458,7 @@ class SingleStreamDiT(nn.Module):
                     freqs,
                     attn_params,
                     use_reentrant=False,
-                    context_fn=lambda: fp4_checkpoint_context_fn(self.fp4_te),
+                    **ckpt_kwargs,
                 )
             else:
                 combined = block(combined, tvec, freqs, attn_params)

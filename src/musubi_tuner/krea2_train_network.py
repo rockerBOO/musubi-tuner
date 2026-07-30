@@ -428,8 +428,11 @@ class Krea2NetworkTrainer(NetworkTrainer):
         # already pads the combined sequence to a multiple of 256 to keep kernel shapes stable.
         # When block swap is on, exclude the swap blocks' Linears from compile (cf. zimage/qwen_image).
         # ConvRot int8 Linears are also excluded: the custom autograd.Function + autotuned Triton
-        # kernels are not dynamo-traceable.
-        disable_linear = self.blocks_to_swap > 0 or args.convrot_int8
+        # kernels are not dynamo-traceable. te.Linear (--fp4_te) is excluded for the same reason:
+        # TE's autograd functions plus its global FP8 state are an untested combination with
+        # dynamo tracing (see the gradient-checkpointing context_fn fix nearby for another facet
+        # of TE's global state not composing cleanly with torch's tracing/replay machinery).
+        disable_linear = self.blocks_to_swap > 0 or args.convrot_int8 or args.fp4_te
         return model_utils.compile_transformer(args, model, [model.blocks], disable_linear=disable_linear)
 
     def scale_shift_latents(self, latents):
@@ -538,8 +541,9 @@ def krea2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
         "(alternative to --fp8_scaled/--convrot_int8; cannot be combined with either). Swaps "
         "per-block Linears for te.Linear at load time and wraps the DiT forward in "
         "te.autocast(NVFP4BlockScaling). Requires transformer_engine installed in the venv "
-        "(not a project dependency — see notes/te-fp4-build-blackwell.md). No VRAM reduction: "
-        "TE keeps a full bf16 master weight and quantizes JIT per forward call.",
+        "(not a project dependency; typically needs building from source per-GPU). No VRAM "
+        "reduction: TE keeps a full bf16 master weight and quantizes JIT per forward call. "
+        "Sample generation during training does not go through this quantized path.",
     )
     parser.add_argument(
         "--text_encoder",
