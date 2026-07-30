@@ -14,6 +14,7 @@ from musubi_tuner.krea2.krea2_encoder import (
 from musubi_tuner.krea2.krea2_mmdit import SingleMMDiTConfig, SingleStreamDiT
 from musubi_tuner.modules.convrot_int8_utils import ConvRotInt8Quantizer, apply_convrot_int8_monkey_patch
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
+from musubi_tuner.modules.te_fp4_utils import swap_linears_to_te
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
 from musubi_tuner.utils.safetensors_utils import load_safetensors
 
@@ -60,6 +61,7 @@ def load_krea2_dit(
     lora_multipliers: Optional[list] = None,
     convrot_int8: bool = False,
     convrot_int8_bwd: str = "bf16",
+    fp4_te: bool = False,
 ) -> SingleStreamDiT:
     """Build the K2 single-stream MMDiT on meta and load weights (assign=True).
 
@@ -72,6 +74,11 @@ def load_krea2_dit(
     fused Triton forward, custom backward for LoRA training) instead of fp8; the same
     target/exclude scope applies. Mutually exclusive with ``fp8_scaled``.
 
+    ``fp4_te`` swaps the per-block Linears for ``te.Linear`` (Transformer Engine) after a
+    normal (unquantized) bf16 load, for use under ``te_fp4_utils.fp4_autocast`` during the
+    forward pass. Unlike ``fp8_scaled``/``convrot_int8`` there is no state-dict-level
+    quantization step. Mutually exclusive with both.
+
     ``lora_weights`` (a list of loaded LoRA state dicts, with optional ``lora_multipliers``)
     are merged into the base weights at load time. This is the only correct route under fp8
     (fp8-quantized weights cannot be post-hoc merged), and it also keeps loading uniform for
@@ -82,7 +89,7 @@ def load_krea2_dit(
     is then False) and the caller's ``enable_block_swap`` / ``move_to_device_except_swap_blocks``
     places the resident blocks on ``device`` and keeps the swap blocks on CPU.
     """
-    assert not (fp8_scaled and convrot_int8), "fp8_scaled and convrot_int8 are mutually exclusive"
+    assert sum([fp8_scaled, convrot_int8, fp4_te]) <= 1, "fp8_scaled, convrot_int8, and fp4_te are mutually exclusive"
     device = torch.device(device)
     loading_device = device if loading_device is None else torch.device(loading_device)
     has_lora = lora_weights is not None and len(lora_weights) > 0
@@ -91,6 +98,7 @@ def load_krea2_dit(
         f"Loading Krea 2 DiT weights from {dit_path}"
         + (" (fp8 scaled)" if fp8_scaled else "")
         + (" (convrot int8)" if convrot_int8 else "")
+        + (" (fp4 te)" if fp4_te else "")
         + (f" (+{len(lora_weights)} LoRA merged)" if has_lora else "")
     )
     with torch.device("meta"):
@@ -137,6 +145,9 @@ def load_krea2_dit(
         # directly to the target device+dtype (assign=True) so the loaded tensors become the params.
         sd = load_safetensors(dit_path, device=loading_device, disable_mmap=True, dtype=dtype)
         dit.load_state_dict(sd, strict=True, assign=True)
+
+    if fp4_te:
+        swap_linears_to_te(dit, KREA2_FP8_OPTIMIZATION_TARGET_KEYS, KREA2_FP8_OPTIMIZATION_EXCLUDE_KEYS)
 
     return dit
 
