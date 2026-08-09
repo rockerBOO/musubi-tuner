@@ -11,7 +11,17 @@ Internal extension point — no API stability guarantees. Subclasses live in
 this repo; if you fork, expect breakage on updates.
 """
 
+import argparse
+import contextlib
+import logging
+
 import torch
+from accelerate import Accelerator
+
+from musubi_tuner.training.timesteps import get_sigmas
+from musubi_tuner.training.trainer_base import DiTOutput
+
+logger = logging.getLogger(__name__)
 
 
 def _select_winner(loss_stack: torch.Tensor) -> torch.Tensor:
@@ -32,3 +42,150 @@ def _gather_winner(stack: torch.Tensor, winner: torch.Tensor) -> torch.Tensor:
     """
     batch_idx = torch.arange(stack.shape[1], device=stack.device)
     return stack[winner, batch_idx]
+
+
+class ExplorativeModelingMixin:
+    """Mix in ahead of a concrete ``NetworkTrainer`` subclass, e.g.::
+
+        class Krea2XMNetworkTrainer(ExplorativeModelingMixin, Krea2NetworkTrainer):
+            pass
+
+    Overrides ``process_batch`` and ``extra_metadata`` only — no architecture
+    hooks, no model edits. When ``args.explorative_modeling`` is off, both
+    delegate to ``super()`` unchanged.
+    """
+
+    def process_batch(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer,
+        network,
+        batch: dict[str, torch.Tensor],
+        latents: torch.Tensor,
+        noise: torch.Tensor,
+        noise_scheduler,
+        dit_dtype: torch.dtype,
+        network_dtype: torch.dtype,
+        vae,
+        global_step: int,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        if not args.explorative_modeling:
+            return super().process_batch(
+                args,
+                accelerator,
+                transformer,
+                network,
+                batch,
+                latents,
+                noise,
+                noise_scheduler,
+                dit_dtype,
+                network_dtype,
+                vae,
+                global_step,
+            )
+
+        k = args.explorative_modeling_k
+        device = accelerator.device
+
+        # Candidate 1: build the noisy input the normal way. This also fixes
+        # `timesteps` for the whole step — every candidate shares the same
+        # per-example timestep, only the noise varies (matches the paper's
+        # pseudocode: `t` is sampled once, `z` is resampled per candidate).
+        noisy_1, timesteps = self.get_noisy_model_input_and_timesteps(
+            args, noise, latents, batch["timesteps"], noise_scheduler, device, dit_dtype
+        )
+
+        noises = [noise]
+        noisy_inputs = [noisy_1]
+        for _ in range(k - 1):
+            noise_k = torch.randn_like(latents)
+            sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=latents.ndim, dtype=dit_dtype)
+            noisy_k = sigmas * noise_k + (1 - sigmas) * latents
+            noises.append(noise_k)
+            noisy_inputs.append(noisy_k)
+
+        memory_efficient = args.explorative_modeling_memory_efficient
+        scoring_context = torch.no_grad() if memory_efficient else contextlib.nullcontext()
+
+        outputs = []
+        per_example_losses = []
+        with scoring_context:
+            for noise_c, noisy_c in zip(noises, noisy_inputs):
+                output_c = self.call_dit(
+                    args, accelerator, transformer, latents, batch, noise_c, noisy_c, timesteps, network_dtype
+                )
+                loss_c, _ = self.compute_loss(
+                    args, output_c, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step, reduction="none"
+                )
+                per_example_losses.append(loss_c)
+                if not memory_efficient:
+                    outputs.append(output_c)
+
+        loss_stack = torch.stack(per_example_losses, dim=0)  # (K, B)
+        winner = _select_winner(loss_stack)
+        candidate_std = loss_stack.std(dim=0).mean().item()
+
+        if memory_efficient:
+            noise_stack = torch.stack(noises, dim=0)
+            noisy_stack = torch.stack(noisy_inputs, dim=0)
+            winner_noise = _gather_winner(noise_stack, winner)
+            winner_noisy = _gather_winner(noisy_stack, winner)
+            winner_output = self.call_dit(
+                args, accelerator, transformer, latents, batch, winner_noise, winner_noisy, timesteps, network_dtype
+            )
+        else:
+            pred_stack = torch.stack([o.pred for o in outputs], dim=0)
+            target_stack = torch.stack([o.target for o in outputs], dim=0)
+            winner_output = DiTOutput(
+                pred=_gather_winner(pred_stack, winner),
+                target=_gather_winner(target_stack, winner),
+            )
+
+        loss, loss_metrics = self.compute_loss(
+            args, winner_output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step
+        )
+        loss_metrics = dict(loss_metrics)
+        loss_metrics["xm/k"] = float(k)
+        loss_metrics["xm/candidate_loss_std"] = candidate_std
+        return loss, loss_metrics
+
+    def extra_metadata(self, args: argparse.Namespace) -> dict:
+        metadata = dict(super().extra_metadata(args))
+        if not args.explorative_modeling:
+            return metadata
+        metadata.update(
+            {
+                "ss_xm": True,
+                "ss_xm_k": args.explorative_modeling_k,
+                "ss_xm_memory_efficient": args.explorative_modeling_memory_efficient,
+            }
+        )
+        return metadata
+
+
+def explorative_modeling_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Explorative Modeling-specific CLI arguments."""
+    parser.add_argument(
+        "--explorative_modeling",
+        action="store_true",
+        help="Enable Explorative Modeling (XM) best-of-K training: sample K noise candidates per example and "
+        "backward only the lowest-loss candidate. See https://explorative-modeling.github.io/.",
+    )
+    parser.add_argument(
+        "--explorative_modeling_k",
+        type=int,
+        default=4,
+        help="Number of noise candidates to explore per training example (K in Forward XM).",
+    )
+    parser.add_argument(
+        "--explorative_modeling_memory_efficient",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Score K candidates under no_grad and backward only a regenerated forward on the per-example "
+        "winner (near-constant memory regardless of K). Use --no-explorative_modeling_memory_efficient to keep "
+        "all K forward graphs live and backward directly through the gathered winner (literal pseudocode, "
+        "~Kx peak activation memory).",
+    )
+    return parser
