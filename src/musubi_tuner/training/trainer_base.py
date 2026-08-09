@@ -1183,6 +1183,7 @@ class NetworkTrainer:
         dit_dtype: torch.dtype,
         network_dtype: torch.dtype,
         global_step: int,
+        reduction: str = "mean",
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Reduce a ``DiTOutput`` to a scalar loss + per-step metrics dict.
 
@@ -1198,11 +1199,21 @@ class NetworkTrainer:
         auxiliary loss only every N steps). ``loss_metrics`` defaults to empty;
         populate with named scalars for loss-decomposition logging
         (e.g. ``{"loss/gen": ..., "loss/rep": ...}``).
+
+        ``reduction="mean"`` (default): reduce over every element, return a
+        0-d scalar tensor. ``reduction="none"``: reduce only over non-batch
+        dims, return a ``(batch_size,)`` tensor — used by best-of-K selection
+        (Explorative Modeling) to compare candidates per example before the
+        final batch-level reduction. Subclasses overriding ``compute_loss``
+        are not required to support ``reduction="none"`` unless they need to
+        compose with per-example candidate selection.
         """
         weighting = compute_loss_weighting_for_sd3(args.weighting_scheme, noise_scheduler, timesteps, timesteps.device, dit_dtype)
         loss = torch.nn.functional.mse_loss(output.pred.to(network_dtype), output.target, reduction="none")
         if weighting is not None:
             loss = loss * weighting
+        if reduction == "none":
+            return loss.mean(dim=tuple(range(1, loss.ndim))), {}
         return loss.mean(), {}
 
     def on_transformer_loaded(
