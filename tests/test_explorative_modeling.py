@@ -139,6 +139,30 @@ def test_process_batch_memory_efficient_scores_then_regenerates():
     assert metrics["xm/candidate_loss_std"] > 0.0
 
 
+def test_process_batch_reports_candidate_loss_distribution_metrics():
+    # Same K=3 scoring setup as test_process_batch_memory_efficient_scores_then_regenerates:
+    #   ex0 candidate losses: [4, 1, 9] -> per-example min=1, max=9, mean=14/3
+    #   ex1 candidate losses: [1, 4, 9] -> per-example min=1, max=9, mean=14/3
+    # Averaged over the batch: min=1.0, max=9.0, avg=14/3.
+    latents, noise = _latents_and_noise()
+    noise_scheduler = FlowMatchDiscreteScheduler()
+    args = _xm_args(explorative_modeling=True, explorative_modeling_k=3, explorative_modeling_memory_efficient=True)
+    batch = {"timesteps": [0.3, 0.7]}
+
+    scored = [[4.0, 1.0], [1.0, 4.0], [9.0, 9.0]]
+    regenerated = [1.0, 1.0]
+    trainer = _ScriptedTrainer(scored + [regenerated])
+
+    _, metrics = trainer.process_batch(
+        args, _FakeAccelerator(), None, None, batch, latents, noise, noise_scheduler,
+        torch.float32, torch.float32, None, 0,
+    )
+
+    assert metrics["xm/candidate_loss_min"] == pytest.approx(1.0, rel=1e-4)
+    assert metrics["xm/candidate_loss_max"] == pytest.approx(9.0, rel=1e-4)
+    assert metrics["xm/candidate_loss_avg"] == pytest.approx(14.0 / 3.0, rel=1e-4)
+
+
 def test_process_batch_memory_efficient_regeneration_uses_gathered_winner_tensors():
     # Same K=3 scoring setup as test_process_batch_memory_efficient_scores_then_regenerates
     # (scored losses [[4,1],[1,4],[9,9]], winners [1, 0]), but this test proves the

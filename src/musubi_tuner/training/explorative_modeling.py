@@ -182,6 +182,9 @@ class ExplorativeModelingMixin:
         loss_stack = torch.stack(per_example_losses, dim=0)  # (K, B)
         winner = _select_winner(loss_stack)
         candidate_std = loss_stack.std(dim=0).mean().item() if k >= 2 else 0.0
+        candidate_min = loss_stack.min(dim=0).values.mean().item()
+        candidate_max = loss_stack.max(dim=0).values.mean().item()
+        candidate_avg = loss_stack.mean(dim=0).mean().item()
 
         if memory_efficient:
             noise_stack = torch.stack(noises, dim=0)
@@ -205,6 +208,9 @@ class ExplorativeModelingMixin:
         loss_metrics = dict(loss_metrics)
         loss_metrics["xm/k"] = float(k)
         loss_metrics["xm/candidate_loss_std"] = candidate_std
+        loss_metrics["xm/candidate_loss_min"] = candidate_min
+        loss_metrics["xm/candidate_loss_max"] = candidate_max
+        loss_metrics["xm/candidate_loss_avg"] = candidate_avg
         return loss, loss_metrics
 
     def extra_metadata(self, args: argparse.Namespace) -> dict:
