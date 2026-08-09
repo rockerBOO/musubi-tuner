@@ -1211,6 +1211,14 @@ class NetworkTrainer:
         weighting = compute_loss_weighting_for_sd3(args.weighting_scheme, noise_scheduler, timesteps, timesteps.device, dit_dtype)
         loss = torch.nn.functional.mse_loss(output.pred.to(network_dtype), output.target, reduction="none")
         if weighting is not None:
+            # `weighting` is always built as a `(batch_size, 1, 1, 1, 1)` tensor (see
+            # `compute_loss_weighting_for_sd3` / `get_sigmas`, hardcoded to n_dim=5), which
+            # only broadcasts correctly against a 5-dim `loss`. For architectures whose
+            # `DiTOutput.pred`/`target` are a different rank (e.g. 4-dim after squeezing),
+            # raw `loss * weighting` broadcasts as an accidental (B, B, ...) outer product
+            # instead of per-example elementwise weighting. Reshape to `loss`'s actual rank
+            # first so this is correct regardless of `loss.ndim`.
+            weighting = weighting.reshape(-1, *([1] * (loss.ndim - 1)))
             loss = loss * weighting
         if reduction == "none":
             return loss.mean(dim=tuple(range(1, loss.ndim))), {}

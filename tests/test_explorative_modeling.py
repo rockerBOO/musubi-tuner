@@ -9,6 +9,7 @@ import torch
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.training import parser_common
 from musubi_tuner.training.explorative_modeling import (
+    _CONTINUOUS_T_SAMPLING_MODES,
     ExplorativeModelingMixin,
     _gather_winner,
     _select_winner,
@@ -260,6 +261,39 @@ def test_process_batch_backward_produces_gradients_both_modes(memory_efficient):
     assert trainer.weight.grad.abs().item() > 0.0
 
 
+def test_memory_efficient_and_literal_modes_agree():
+    # Design-doc requirement: memory-efficient and literal modes must select the SAME
+    # per-example winner and produce a numerically equal loss/gradient for the same RNG-seeded
+    # candidates -- the extra regeneration forward in memory-efficient mode should be exactly
+    # equivalent to literal mode's gathered loss for the same winner, not just "close". Uses
+    # `_DifferentiableTrainer` (real `nn.Parameter`, input-dependent `pred`) because
+    # `_ScriptedTrainer`'s losses are keyed on call ORDER regardless of input tensors, so it
+    # cannot prove the two modes agree on a real input-dependent computation.
+    latents, noise = _latents_and_noise()
+    batch = {"timesteps": [0.3, 0.7]}
+
+    def run(memory_efficient):
+        noise_scheduler = FlowMatchDiscreteScheduler()
+        args = _xm_args(
+            explorative_modeling=True, explorative_modeling_k=4, explorative_modeling_memory_efficient=memory_efficient
+        )
+        trainer = _DifferentiableTrainer()
+        torch.manual_seed(1234)  # candidates 2..K use torch.randn_like -- seed identically per run
+        loss, metrics = trainer.process_batch(
+            args, _FakeAccelerator(), None, None, batch, latents, noise, noise_scheduler,
+            torch.float32, torch.float32, None, 0,
+        )
+        loss.backward()
+        return loss, trainer.weight.grad.clone(), metrics
+
+    loss_me, grad_me, metrics_me = run(memory_efficient=True)
+    loss_lit, grad_lit, metrics_lit = run(memory_efficient=False)
+
+    assert torch.allclose(loss_me, loss_lit, atol=1e-6)
+    assert torch.allclose(grad_me, grad_lit, atol=1e-6)
+    assert metrics_me["xm/candidate_loss_std"] == pytest.approx(metrics_lit["xm/candidate_loss_std"], abs=1e-6)
+
+
 def test_extra_metadata_includes_xm_keys_when_enabled():
     trainer = _ScriptedTrainer([])
     args = _xm_args(explorative_modeling=True, explorative_modeling_k=5, explorative_modeling_memory_efficient=False)
@@ -274,6 +308,23 @@ def test_extra_metadata_empty_when_disabled():
     args = _xm_args(explorative_modeling=False)
     metadata = trainer.extra_metadata(args)
     assert metadata == {}
+
+
+def test_continuous_t_sampling_modes_matches_argparse_choices_minus_sigma():
+    # Drift guard: `_CONTINUOUS_T_SAMPLING_MODES` is a hand-copied mirror of the dispatch
+    # condition in `NetworkTrainer.get_noisy_model_input_and_timesteps` (which modes take the
+    # continuous-t path vs. the on-schedule "sigma" path). If a new `--timestep_sampling` mode
+    # is added to parser_common.py's `choices` without updating this frozenset, candidates 2..K
+    # silently fall into the wrong noising branch -- no test failure today without this guard.
+    # Pull `choices` from a real, live parser (not a second hardcoded copy) so this test fails
+    # the moment the two definitions actually diverge.
+    parser = parser_common.setup_parser_common()
+    timestep_sampling_action = next(
+        action for action in parser._actions if "--timestep_sampling" in action.option_strings
+    )
+    argparse_choices = set(timestep_sampling_action.choices)
+
+    assert argparse_choices - {"sigma"} == _CONTINUOUS_T_SAMPLING_MODES
 
 
 def test_parser_defaults():

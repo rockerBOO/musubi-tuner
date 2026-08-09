@@ -70,6 +70,23 @@ class ExplorativeModelingMixin:
     Overrides ``process_batch`` and ``extra_metadata`` only — no architecture
     hooks, no model edits. When ``args.explorative_modeling`` is off, both
     delegate to ``super()`` unchanged.
+
+    Known composability gaps (documented, not fixed here — see the design doc
+    for detail):
+
+    - Candidates 2..K are built by reimplementing the base trainer's noising
+      math directly (the continuous-t / ``get_sigmas`` branches in
+      ``process_batch`` below), not by re-invoking
+      ``self.get_noisy_model_input_and_timesteps``. Only candidate 1 goes
+      through that (possibly overridden) method. Architectures overriding
+      ``get_noisy_model_input_and_timesteps`` — e.g. ``wan_train_network.py``
+      (high/low-noise resampling) and ``hidream_o1_train_network.py`` (its own
+      sigma construction plus noise-clip) — would get candidate 1 noised
+      differently from candidates 2..K if mixed in with XM.
+    - Scoring calls ``self.compute_loss(..., reduction="none")``. Architectures
+      overriding ``compute_loss`` without a ``reduction`` parameter — e.g.
+      ``ideogram4_train_network.py`` and ``hidream_o1_train_network.py`` —
+      raise ``TypeError`` immediately when mixed in with XM.
     """
 
     def process_batch(
