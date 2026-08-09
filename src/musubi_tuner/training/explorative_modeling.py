@@ -12,16 +12,11 @@ this repo; if you fork, expect breakage on updates.
 """
 
 import argparse
-import contextlib
-import logging
 
 import torch
 from accelerate import Accelerator
 
-from musubi_tuner.training.timesteps import get_sigmas
 from musubi_tuner.training.trainer_base import DiTOutput
-
-logger = logging.getLogger(__name__)
 
 
 def _select_winner(loss_stack: torch.Tensor) -> torch.Tensor:
@@ -99,15 +94,23 @@ class ExplorativeModelingMixin:
 
         noises = [noise]
         noisy_inputs = [noisy_1]
-        for _ in range(k - 1):
-            noise_k = torch.randn_like(latents)
-            sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=latents.ndim, dtype=dit_dtype)
-            noisy_k = sigmas * noise_k + (1 - sigmas) * latents
-            noises.append(noise_k)
-            noisy_inputs.append(noisy_k)
+        if k > 1:
+            # Invert the exact `t * 1000 + 1` transform `get_noisy_model_input_and_timesteps`
+            # applied to produce `timesteps`, recovering the continuous `t` in [0, 1] directly.
+            # This is exact (not an approximation) and avoids routing through `get_sigmas`,
+            # which would nearest-neighbor-round `timesteps` back onto the discrete schedule
+            # (since `timesteps` is off-schedule by construction) — that both warns every
+            # call and introduces a small systematic sigma offset vs. candidate 1, biasing
+            # best-of-K selection toward candidate 1.
+            t = ((timesteps - 1.0) / 1000.0).view(-1, *([1] * (latents.ndim - 1))).to(device=device, dtype=latents.dtype)
+            for _ in range(k - 1):
+                noise_k = torch.randn_like(latents)
+                noisy_k = (1 - t) * latents + t * noise_k
+                noises.append(noise_k)
+                noisy_inputs.append(noisy_k)
 
         memory_efficient = args.explorative_modeling_memory_efficient
-        scoring_context = torch.no_grad() if memory_efficient else contextlib.nullcontext()
+        scoring_context = torch.no_grad() if memory_efficient else torch.enable_grad()
 
         outputs = []
         per_example_losses = []
@@ -125,7 +128,7 @@ class ExplorativeModelingMixin:
 
         loss_stack = torch.stack(per_example_losses, dim=0)  # (K, B)
         winner = _select_winner(loss_stack)
-        candidate_std = loss_stack.std(dim=0).mean().item()
+        candidate_std = loss_stack.std(dim=0).mean().item() if k >= 2 else 0.0
 
         if memory_efficient:
             noise_stack = torch.stack(noises, dim=0)

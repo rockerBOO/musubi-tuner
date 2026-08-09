@@ -74,17 +74,20 @@ def _latents_and_noise(batch_size=2, shape=(4, 1, 2, 2)):
 
 
 class _ScriptedTrainer(ExplorativeModelingMixin, NetworkTrainer):
-    """Test double: call_dit ignores its tensor inputs and returns a scripted
-    per-example loss for each successive invocation, in call order. Lets us
-    control exactly what each candidate's loss is without a real transformer.
+    """Test double: call_dit ignores its tensor inputs (beyond recording them)
+    and returns a scripted per-example loss for each successive invocation,
+    in call order. Lets us control exactly what each candidate's loss is
+    without a real transformer.
     """
 
     def __init__(self, scripted_losses):
         super().__init__()
         self._scripted_losses = [torch.tensor(vals, dtype=torch.float32) for vals in scripted_losses]
         self.call_count = 0
+        self.received_noise = []
 
     def call_dit(self, args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype, **kwargs):
+        self.received_noise.append(noise.clone())
         vals = self._scripted_losses[self.call_count]
         self.call_count += 1
         shape = latents.shape
@@ -134,6 +137,46 @@ def test_process_batch_memory_efficient_scores_then_regenerates():
     assert metrics["xm/candidate_loss_std"] > 0.0
 
 
+def test_process_batch_memory_efficient_regeneration_uses_gathered_winner_tensors():
+    # Same K=3 scoring setup as test_process_batch_memory_efficient_scores_then_regenerates
+    # (scored losses [[4,1],[1,4],[9,9]], winners [1, 0]), but this test proves the
+    # regeneration forward actually receives the *gathered per-example winner* noise
+    # tensors, not e.g. the original candidate-0 noise/noisy_1 reused by mistake.
+    # _ScriptedTrainer.call_dit ignores its tensor args for computing loss (loss is
+    # scripted by call order), so a bug that swaps in the wrong candidate tensors for
+    # the regeneration forward would not change `loss` or `call_count` at all — only
+    # inspecting the recorded `noise` tensors per call catches it.
+    latents, noise = _latents_and_noise()
+    noise_scheduler = FlowMatchDiscreteScheduler()
+    args = _xm_args(explorative_modeling=True, explorative_modeling_k=3, explorative_modeling_memory_efficient=True)
+    batch = {"timesteps": [0.3, 0.7]}
+
+    scored = [[4.0, 1.0], [1.0, 4.0], [9.0, 9.0]]  # winners: ex0 -> candidate 1, ex1 -> candidate 0
+    regenerated = [1.0, 1.0]
+    trainer = _ScriptedTrainer(scored + [regenerated])
+
+    torch.manual_seed(0)  # candidates 1 and 2 use torch.randn_like(latents); seed for reproducibility
+    trainer.process_batch(
+        args, _FakeAccelerator(), None, None, batch, latents, noise, noise_scheduler,
+        torch.float32, torch.float32, None, 0,
+    )
+
+    assert trainer.call_count == 4
+    candidate_0_noise, candidate_1_noise, candidate_2_noise, regeneration_noise = trainer.received_noise
+
+    # Sanity: the three candidates' noise tensors must actually differ (otherwise this
+    # test couldn't distinguish a correct gather from a wrong one).
+    assert not torch.equal(candidate_0_noise, candidate_1_noise)
+    assert not torch.equal(candidate_0_noise, candidate_2_noise)
+
+    # Example 0's winner is candidate 1 -> regeneration's noise[0] must equal candidate 1's noise[0].
+    assert torch.equal(regeneration_noise[0], candidate_1_noise[0])
+    # Example 1's winner is candidate 0 -> regeneration's noise[1] must equal candidate 0's noise[1].
+    assert torch.equal(regeneration_noise[1], candidate_0_noise[1])
+    # And the regeneration forward must NOT just reuse candidate 0's (original) noise wholesale.
+    assert not torch.equal(regeneration_noise[0], candidate_0_noise[0])
+
+
 def test_process_batch_literal_mode_reuses_scored_forward_no_extra_call():
     latents, noise = _latents_and_noise()
     noise_scheduler = FlowMatchDiscreteScheduler()
@@ -177,6 +220,43 @@ def test_process_batch_k1_matches_disabled_numerically():
     )
 
     assert loss_on.item() == pytest.approx(loss_off.item(), rel=1e-4)
+
+
+class _DifferentiableTrainer(ExplorativeModelingMixin, NetworkTrainer):
+    """Test double whose ``call_dit`` builds ``pred`` from a real ``nn.Parameter``
+    via a differentiable op, so ``.backward()`` on the returned loss has somewhere
+    real to flow. Used to prove neither scoring mode (memory-efficient / literal)
+    accidentally leaves the final loss detached from the graph.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor(2.0))
+
+    def call_dit(self, args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype, **kwargs):
+        pred = self.weight * noisy_model_input
+        target = torch.zeros_like(pred)
+        return DiTOutput(pred=pred, target=target)
+
+
+@pytest.mark.parametrize("memory_efficient", [True, False])
+def test_process_batch_backward_produces_gradients_both_modes(memory_efficient):
+    latents, noise = _latents_and_noise()
+    noise_scheduler = FlowMatchDiscreteScheduler()
+    args = _xm_args(
+        explorative_modeling=True, explorative_modeling_k=3, explorative_modeling_memory_efficient=memory_efficient
+    )
+    batch = {"timesteps": [0.3, 0.7]}
+    trainer = _DifferentiableTrainer()
+
+    loss, _ = trainer.process_batch(
+        args, _FakeAccelerator(), None, None, batch, latents, noise, noise_scheduler,
+        torch.float32, torch.float32, None, 0,
+    )
+    loss.backward()
+
+    assert trainer.weight.grad is not None
+    assert trainer.weight.grad.abs().item() > 0.0
 
 
 def test_extra_metadata_includes_xm_keys_when_enabled():
