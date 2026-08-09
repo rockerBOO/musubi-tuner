@@ -16,7 +16,29 @@ import argparse
 import torch
 from accelerate import Accelerator
 
+from musubi_tuner.training.timesteps import get_sigmas
 from musubi_tuner.training.trainer_base import DiTOutput
+
+# Sampling modes that produce continuous `t` in [0, 1] and off-schedule
+# `timesteps = t * 1000 + 1` (see `NetworkTrainer.get_noisy_model_input_and_timesteps`
+# in trainer_base.py). Mirrors that method's own dispatch condition exactly —
+# keep in sync with it. Everything else (i.e. the "sigma" default) samples
+# on-schedule discrete timesteps directly and must go through `get_sigmas`.
+_CONTINUOUS_T_SAMPLING_MODES = frozenset(
+    {
+        "uniform",
+        "sigmoid",
+        "shift",
+        "flux_shift",
+        "qwen_shift",
+        "krea2_shift",
+        "ideogram4_shift",
+        "logsnr",
+        "qinglong_flux",
+        "qinglong_qwen",
+        "flux2_shift",
+    }
+)
 
 
 def _select_winner(loss_stack: torch.Tensor) -> torch.Tensor:
@@ -95,19 +117,33 @@ class ExplorativeModelingMixin:
         noises = [noise]
         noisy_inputs = [noisy_1]
         if k > 1:
-            # Invert the exact `t * 1000 + 1` transform `get_noisy_model_input_and_timesteps`
-            # applied to produce `timesteps`, recovering the continuous `t` in [0, 1] directly.
-            # This is exact (not an approximation) and avoids routing through `get_sigmas`,
-            # which would nearest-neighbor-round `timesteps` back onto the discrete schedule
-            # (since `timesteps` is off-schedule by construction) — that both warns every
-            # call and introduces a small systematic sigma offset vs. candidate 1, biasing
-            # best-of-K selection toward candidate 1.
-            t = ((timesteps - 1.0) / 1000.0).view(-1, *([1] * (latents.ndim - 1))).to(device=device, dtype=latents.dtype)
-            for _ in range(k - 1):
-                noise_k = torch.randn_like(latents)
-                noisy_k = (1 - t) * latents + t * noise_k
-                noises.append(noise_k)
-                noisy_inputs.append(noisy_k)
+            if args.timestep_sampling in _CONTINUOUS_T_SAMPLING_MODES:
+                # `timesteps` is off-schedule by construction here (`t * 1000 + 1` for
+                # continuous `t`). Invert that exact transform to recover `t` directly —
+                # this matches the base trainer's own math for this family and avoids
+                # routing through `get_sigmas`, which would nearest-neighbor-round
+                # off-schedule `timesteps` back onto the discrete schedule (warning every
+                # call and introducing a small systematic sigma offset vs. candidate 1).
+                # Note: `t` is left in its natural (float32) dtype — no cast to
+                # `latents.dtype` — matching how the base trainer keeps `t` before the
+                # interpolation; casting down to bf16/fp16 here would quantize `t` and
+                # reintroduce a sigma offset between candidate 1 and candidates 2..K.
+                t = ((timesteps - 1.0) / 1000.0).view(-1, *([1] * (latents.ndim - 1))).to(device=device)
+                for _ in range(k - 1):
+                    noise_k = torch.randn_like(latents)
+                    noisy_k = (1 - t) * latents + t * noise_k
+                    noises.append(noise_k)
+                    noisy_inputs.append(noisy_k)
+            else:
+                # "sigma" (the argparse default): `timesteps` is already on-schedule by
+                # construction, so `get_sigmas` is exact here (no rounding, no warning) —
+                # this is exactly what the base trainer's own "sigma" branch does.
+                sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=latents.ndim, dtype=dit_dtype)
+                for _ in range(k - 1):
+                    noise_k = torch.randn_like(latents)
+                    noisy_k = sigmas * noise_k + (1.0 - sigmas) * latents
+                    noises.append(noise_k)
+                    noisy_inputs.append(noisy_k)
 
         memory_efficient = args.explorative_modeling_memory_efficient
         scoring_context = torch.no_grad() if memory_efficient else torch.enable_grad()

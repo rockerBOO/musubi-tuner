@@ -14,6 +14,7 @@ from musubi_tuner.training.explorative_modeling import (
     _select_winner,
     explorative_modeling_setup_parser,
 )
+from musubi_tuner.training.timesteps import get_sigmas
 from musubi_tuner.training.trainer_base import DiTOutput, NetworkTrainer
 
 
@@ -281,6 +282,112 @@ def test_parser_defaults():
     assert args.explorative_modeling is False
     assert args.explorative_modeling_k == 4
     assert args.explorative_modeling_memory_efficient is True
+
+
+class _NoisyInputRecordingTrainer(ExplorativeModelingMixin, NetworkTrainer):
+    """Test double: `call_dit` records the exact `noise` / `noisy_model_input` /
+    `timesteps` tensors it receives per call (in call order) and returns a
+    constant scripted loss, so `process_batch` can run to completion without a
+    real transformer while we inspect exactly what candidate noising produced.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.call_count = 0
+        self.received_noise = []
+        self.received_noisy = []
+        self.received_timesteps = []
+
+    def call_dit(self, args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype, **kwargs):
+        self.call_count += 1
+        self.received_noise.append(noise.clone())
+        self.received_noisy.append(noisy_model_input.clone())
+        self.received_timesteps.append(timesteps.clone())
+        pred = torch.zeros_like(latents)
+        target = torch.zeros_like(latents)
+        return DiTOutput(pred=pred, target=target)
+
+
+def test_process_batch_candidate2_matches_base_trainer_formula_continuous_family():
+    # "uniform" belongs to the continuous-t family: `get_noisy_model_input_and_timesteps`
+    # computes `t` in [0, 1] directly and returns `timesteps = t * 1000 + 1` (off-schedule).
+    # The mixin must invert that exact transform for candidates 2..K.
+    latents = torch.randn(2, 4, 1, 2, 2)
+    noise_1 = torch.randn(2, 4, 1, 2, 2)
+    noise_scheduler = FlowMatchDiscreteScheduler()
+    args = _xm_args(
+        timestep_sampling="uniform",
+        explorative_modeling=True,
+        explorative_modeling_k=2,
+        explorative_modeling_memory_efficient=False,
+    )
+    batch = {"timesteps": [0.3, 0.7]}
+    trainer = _NoisyInputRecordingTrainer()
+
+    trainer.process_batch(
+        args, _FakeAccelerator(), None, None, batch, latents, noise_1, noise_scheduler,
+        torch.float32, torch.float32, None, 0,
+    )
+
+    assert trainer.call_count == 2  # k=2, literal mode: no extra regeneration forward
+    noise_2_actual = trainer.received_noise[1]
+    noisy_2_actual = trainer.received_noisy[1]
+
+    # Reference: call the base trainer's OWN `get_noisy_model_input_and_timesteps` a
+    # second time, with candidate 2's actual noise. For "uniform", `batch["timesteps"]`
+    # (org_timesteps) is consumed directly as `t` with no randomness involved, so passing
+    # the same `batch["timesteps"]` again deterministically reproduces the same `t` (and
+    # therefore the same `timesteps`) as candidate 1 used — this is exactly the base
+    # trainer's own formula, used as ground truth for what candidate 2 SHOULD look like.
+    reference_trainer = NetworkTrainer()
+    noisy_2_reference, timesteps_reference = reference_trainer.get_noisy_model_input_and_timesteps(
+        args, noise_2_actual, latents, batch["timesteps"], noise_scheduler, torch.device("cpu"), torch.float32
+    )
+
+    assert torch.equal(timesteps_reference, trainer.received_timesteps[1])
+    assert torch.allclose(noisy_2_actual, noisy_2_reference, atol=1e-6)
+
+
+def test_process_batch_candidate2_matches_base_trainer_formula_sigma_family():
+    # "sigma" is the argparse DEFAULT: `get_noisy_model_input_and_timesteps` samples
+    # discrete on-schedule timesteps directly (no `+1` offset; `sigma = timesteps / 1000`
+    # exactly via `get_sigmas`). This is the family the first fix round got wrong (it
+    # applied the continuous family's `(timesteps - 1) / 1000` inversion unconditionally,
+    # which is off by the `-1` for this branch).
+    latents = torch.randn(2, 4, 1, 2, 2)
+    noise_1 = torch.randn(2, 4, 1, 2, 2)
+    noise_scheduler = FlowMatchDiscreteScheduler()
+    args = _xm_args(
+        timestep_sampling="sigma",
+        explorative_modeling=True,
+        explorative_modeling_k=2,
+        explorative_modeling_memory_efficient=False,
+    )
+    batch = {"timesteps": [0.3, 0.7]}
+    trainer = _NoisyInputRecordingTrainer()
+
+    trainer.process_batch(
+        args, _FakeAccelerator(), None, None, batch, latents, noise_1, noise_scheduler,
+        torch.float32, torch.float32, None, 0,
+    )
+
+    assert trainer.call_count == 2  # k=2, literal mode: no extra regeneration forward
+    timesteps_shared = trainer.received_timesteps[0]
+    assert torch.equal(timesteps_shared, trainer.received_timesteps[1])  # same t for both candidates
+    noise_2_actual = trainer.received_noise[1]
+    noisy_2_actual = trainer.received_noisy[1]
+
+    # Reference: `get_noisy_model_input_and_timesteps` has no mechanism to force a
+    # specific `timesteps` for the "sigma" branch (it always resamples via
+    # `compute_density_for_timestep_sampling`, ignoring the `timesteps` argument for this
+    # branch) — so we instead call `get_sigmas` directly, which IS the base trainer's own
+    # formula for this branch (imported verbatim into trainer_base.py and used exactly as
+    # `sigmas = get_sigmas(...); noisy = sigmas * noise + (1 - sigmas) * latents`), applied
+    # to the ACTUAL shared `timesteps` the mixin produced and candidate 2's actual noise.
+    sigmas_reference = get_sigmas(noise_scheduler, timesteps_shared, torch.device("cpu"), n_dim=latents.ndim, dtype=torch.float32)
+    noisy_2_reference = sigmas_reference * noise_2_actual + (1.0 - sigmas_reference) * latents
+
+    assert torch.allclose(noisy_2_actual, noisy_2_reference, atol=1e-6)
 
 
 def test_parser_accepts_overrides():
