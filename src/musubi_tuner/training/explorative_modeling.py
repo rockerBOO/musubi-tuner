@@ -12,12 +12,15 @@ this repo; if you fork, expect breakage on updates.
 """
 
 import argparse
+import logging
 
 import torch
 from accelerate import Accelerator
 
 from musubi_tuner.training.timesteps import get_sigmas
 from musubi_tuner.training.trainer_base import DiTOutput
+
+logger = logging.getLogger(__name__)
 
 # Sampling modes that produce continuous `t` in [0, 1] and off-schedule
 # `timesteps = t * 1000 + 1` (see `NetworkTrainer.get_noisy_model_input_and_timesteps`
@@ -212,6 +215,23 @@ class ExplorativeModelingMixin:
         loss_metrics["xm/candidate_loss_max"] = candidate_max
         loss_metrics["xm/candidate_loss_avg"] = candidate_avg
         return loss, loss_metrics
+
+    def on_train_start(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network,
+        transformer,
+        optimizer,
+    ) -> None:
+        super().on_train_start(args, accelerator, network, transformer, optimizer)
+        if not args.explorative_modeling:
+            return
+        logger.info(
+            "Explorative Modeling (XM) enabled: k=%d, memory_efficient=%s",
+            args.explorative_modeling_k,
+            args.explorative_modeling_memory_efficient,
+        )
 
     def extra_metadata(self, args: argparse.Namespace) -> dict:
         metadata = dict(super().extra_metadata(args))

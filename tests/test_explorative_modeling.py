@@ -334,6 +334,24 @@ def test_extra_metadata_empty_when_disabled():
     assert metadata == {}
 
 
+def test_on_train_start_logs_when_enabled(caplog):
+    trainer = _ScriptedTrainer([])
+    args = _xm_args(explorative_modeling=True, explorative_modeling_k=5, explorative_modeling_memory_efficient=False)
+    with caplog.at_level("INFO", logger="musubi_tuner.training.explorative_modeling"):
+        trainer.on_train_start(args, _FakeAccelerator(), None, None, None)
+    assert any("Explorative Modeling" in record.message for record in caplog.records)
+    assert any("k=5" in record.message for record in caplog.records)
+    assert any("memory_efficient=False" in record.message for record in caplog.records)
+
+
+def test_on_train_start_silent_when_disabled(caplog):
+    trainer = _ScriptedTrainer([])
+    args = _xm_args(explorative_modeling=False)
+    with caplog.at_level("INFO", logger="musubi_tuner.training.explorative_modeling"):
+        trainer.on_train_start(args, _FakeAccelerator(), None, None, None)
+    assert caplog.records == []
+
+
 def test_continuous_t_sampling_modes_matches_argparse_choices_minus_sigma():
     # Drift guard: `_CONTINUOUS_T_SAMPLING_MODES` is a hand-copied mirror of the dispatch
     # condition in `NetworkTrainer.get_noisy_model_input_and_timesteps` (which modes take the
