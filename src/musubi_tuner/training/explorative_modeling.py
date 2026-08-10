@@ -172,9 +172,7 @@ class ExplorativeModelingMixin:
         per_example_losses = []
         with scoring_context:
             for noise_c, noisy_c in zip(noises, noisy_inputs):
-                output_c = self.call_dit(
-                    args, accelerator, transformer, latents, batch, noise_c, noisy_c, timesteps, network_dtype
-                )
+                output_c = self.call_dit(args, accelerator, transformer, latents, batch, noise_c, noisy_c, timesteps, network_dtype)
                 loss_c, _ = self.compute_loss(
                     args, output_c, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step, reduction="none"
                 )

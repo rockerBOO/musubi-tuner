@@ -88,7 +88,9 @@ class _ScriptedTrainer(ExplorativeModelingMixin, NetworkTrainer):
         self.call_count = 0
         self.received_noise = []
 
-    def call_dit(self, args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype, **kwargs):
+    def call_dit(
+        self, args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype, **kwargs
+    ):
         self.received_noise.append(noise.clone())
         vals = self._scripted_losses[self.call_count]
         self.call_count += 1
@@ -106,8 +108,18 @@ def test_process_batch_disabled_falls_through_to_base():
     trainer = _ScriptedTrainer([[4.0, 1.0]])
 
     loss, metrics = trainer.process_batch(
-        args, _FakeAccelerator(), None, None, batch, latents, noise, noise_scheduler,
-        torch.float32, torch.float32, None, 0,
+        args,
+        _FakeAccelerator(),
+        None,
+        None,
+        batch,
+        latents,
+        noise,
+        noise_scheduler,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
     )
 
     assert trainer.call_count == 1
@@ -129,8 +141,18 @@ def test_process_batch_memory_efficient_scores_then_regenerates():
     trainer = _ScriptedTrainer(scored + [regenerated])
 
     loss, metrics = trainer.process_batch(
-        args, _FakeAccelerator(), None, None, batch, latents, noise, noise_scheduler,
-        torch.float32, torch.float32, None, 0,
+        args,
+        _FakeAccelerator(),
+        None,
+        None,
+        batch,
+        latents,
+        noise,
+        noise_scheduler,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
     )
 
     assert trainer.call_count == 4  # K scoring calls + 1 regeneration
@@ -154,8 +176,18 @@ def test_process_batch_reports_candidate_loss_distribution_metrics():
     trainer = _ScriptedTrainer(scored + [regenerated])
 
     _, metrics = trainer.process_batch(
-        args, _FakeAccelerator(), None, None, batch, latents, noise, noise_scheduler,
-        torch.float32, torch.float32, None, 0,
+        args,
+        _FakeAccelerator(),
+        None,
+        None,
+        batch,
+        latents,
+        noise,
+        noise_scheduler,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
     )
 
     assert metrics["xm/candidate_loss_min"] == pytest.approx(1.0, rel=1e-4)
@@ -183,8 +215,18 @@ def test_process_batch_memory_efficient_regeneration_uses_gathered_winner_tensor
 
     torch.manual_seed(0)  # candidates 1 and 2 use torch.randn_like(latents); seed for reproducibility
     trainer.process_batch(
-        args, _FakeAccelerator(), None, None, batch, latents, noise, noise_scheduler,
-        torch.float32, torch.float32, None, 0,
+        args,
+        _FakeAccelerator(),
+        None,
+        None,
+        batch,
+        latents,
+        noise,
+        noise_scheduler,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
     )
 
     assert trainer.call_count == 4
@@ -214,8 +256,18 @@ def test_process_batch_literal_mode_reuses_scored_forward_no_extra_call():
     trainer = _ScriptedTrainer(scored)  # no extra scripted loss for a regeneration call
 
     loss, metrics = trainer.process_batch(
-        args, _FakeAccelerator(), None, None, batch, latents, noise, noise_scheduler,
-        torch.float32, torch.float32, None, 0,
+        args,
+        _FakeAccelerator(),
+        None,
+        None,
+        batch,
+        latents,
+        noise,
+        noise_scheduler,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
     )
 
     assert trainer.call_count == 3  # no extra forward — literal mode gathers from the scored outputs
@@ -237,12 +289,32 @@ def test_process_batch_k1_matches_disabled_numerically():
     trainer_on = _ScriptedTrainer(list(scripted))
 
     loss_off, _ = trainer_off.process_batch(
-        args_off, _FakeAccelerator(), None, None, batch, latents, noise, noise_scheduler,
-        torch.float32, torch.float32, None, 0,
+        args_off,
+        _FakeAccelerator(),
+        None,
+        None,
+        batch,
+        latents,
+        noise,
+        noise_scheduler,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
     )
     loss_on, _ = trainer_on.process_batch(
-        args_on, _FakeAccelerator(), None, None, batch, latents, noise, noise_scheduler,
-        torch.float32, torch.float32, None, 0,
+        args_on,
+        _FakeAccelerator(),
+        None,
+        None,
+        batch,
+        latents,
+        noise,
+        noise_scheduler,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
     )
 
     assert loss_on.item() == pytest.approx(loss_off.item(), rel=1e-4)
@@ -259,7 +331,9 @@ class _DifferentiableTrainer(ExplorativeModelingMixin, NetworkTrainer):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.tensor(2.0))
 
-    def call_dit(self, args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype, **kwargs):
+    def call_dit(
+        self, args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype, **kwargs
+    ):
         pred = self.weight * noisy_model_input
         target = torch.zeros_like(pred)
         return DiTOutput(pred=pred, target=target)
@@ -269,15 +343,23 @@ class _DifferentiableTrainer(ExplorativeModelingMixin, NetworkTrainer):
 def test_process_batch_backward_produces_gradients_both_modes(memory_efficient):
     latents, noise = _latents_and_noise()
     noise_scheduler = FlowMatchDiscreteScheduler()
-    args = _xm_args(
-        explorative_modeling=True, explorative_modeling_k=3, explorative_modeling_memory_efficient=memory_efficient
-    )
+    args = _xm_args(explorative_modeling=True, explorative_modeling_k=3, explorative_modeling_memory_efficient=memory_efficient)
     batch = {"timesteps": [0.3, 0.7]}
     trainer = _DifferentiableTrainer()
 
     loss, _ = trainer.process_batch(
-        args, _FakeAccelerator(), None, None, batch, latents, noise, noise_scheduler,
-        torch.float32, torch.float32, None, 0,
+        args,
+        _FakeAccelerator(),
+        None,
+        None,
+        batch,
+        latents,
+        noise,
+        noise_scheduler,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
     )
     loss.backward()
 
@@ -298,14 +380,22 @@ def test_memory_efficient_and_literal_modes_agree():
 
     def run(memory_efficient):
         noise_scheduler = FlowMatchDiscreteScheduler()
-        args = _xm_args(
-            explorative_modeling=True, explorative_modeling_k=4, explorative_modeling_memory_efficient=memory_efficient
-        )
+        args = _xm_args(explorative_modeling=True, explorative_modeling_k=4, explorative_modeling_memory_efficient=memory_efficient)
         trainer = _DifferentiableTrainer()
         torch.manual_seed(1234)  # candidates 2..K use torch.randn_like -- seed identically per run
         loss, metrics = trainer.process_batch(
-            args, _FakeAccelerator(), None, None, batch, latents, noise, noise_scheduler,
-            torch.float32, torch.float32, None, 0,
+            args,
+            _FakeAccelerator(),
+            None,
+            None,
+            batch,
+            latents,
+            noise,
+            noise_scheduler,
+            torch.float32,
+            torch.float32,
+            None,
+            0,
         )
         loss.backward()
         return loss, trainer.weight.grad.clone(), metrics
@@ -361,9 +451,7 @@ def test_continuous_t_sampling_modes_matches_argparse_choices_minus_sigma():
     # Pull `choices` from a real, live parser (not a second hardcoded copy) so this test fails
     # the moment the two definitions actually diverge.
     parser = parser_common.setup_parser_common()
-    timestep_sampling_action = next(
-        action for action in parser._actions if "--timestep_sampling" in action.option_strings
-    )
+    timestep_sampling_action = next(action for action in parser._actions if "--timestep_sampling" in action.option_strings)
     argparse_choices = set(timestep_sampling_action.choices)
 
     assert argparse_choices - {"sigma"} == _CONTINUOUS_T_SAMPLING_MODES
@@ -391,7 +479,9 @@ class _NoisyInputRecordingTrainer(ExplorativeModelingMixin, NetworkTrainer):
         self.received_noisy = []
         self.received_timesteps = []
 
-    def call_dit(self, args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype, **kwargs):
+    def call_dit(
+        self, args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype, **kwargs
+    ):
         self.call_count += 1
         self.received_noise.append(noise.clone())
         self.received_noisy.append(noisy_model_input.clone())
@@ -418,8 +508,18 @@ def test_process_batch_candidate2_matches_base_trainer_formula_continuous_family
     trainer = _NoisyInputRecordingTrainer()
 
     trainer.process_batch(
-        args, _FakeAccelerator(), None, None, batch, latents, noise_1, noise_scheduler,
-        torch.float32, torch.float32, None, 0,
+        args,
+        _FakeAccelerator(),
+        None,
+        None,
+        batch,
+        latents,
+        noise_1,
+        noise_scheduler,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
     )
 
     assert trainer.call_count == 2  # k=2, literal mode: no extra regeneration forward
@@ -460,8 +560,18 @@ def test_process_batch_candidate2_matches_base_trainer_formula_sigma_family():
     trainer = _NoisyInputRecordingTrainer()
 
     trainer.process_batch(
-        args, _FakeAccelerator(), None, None, batch, latents, noise_1, noise_scheduler,
-        torch.float32, torch.float32, None, 0,
+        args,
+        _FakeAccelerator(),
+        None,
+        None,
+        batch,
+        latents,
+        noise_1,
+        noise_scheduler,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
     )
 
     assert trainer.call_count == 2  # k=2, literal mode: no extra regeneration forward

@@ -25,9 +25,7 @@ def test_reduction_none_returns_per_example_shape():
     output = DiTOutput(pred=pred, target=target)
     timesteps = torch.tensor([500.0, 500.0])
 
-    per_example, metrics = trainer.compute_loss(
-        args, output, timesteps, None, torch.float32, torch.float32, 0, reduction="none"
-    )
+    per_example, metrics = trainer.compute_loss(args, output, timesteps, None, torch.float32, torch.float32, 0, reduction="none")
 
     assert per_example.shape == (2,)
     assert per_example[0].item() == pytest.approx((2.0**2 + 0.0**2) / 2)
@@ -44,9 +42,7 @@ def test_reduction_mean_matches_batch_average_of_none():
     timesteps = torch.tensor([500.0, 500.0])
 
     scalar, _ = trainer.compute_loss(args, output, timesteps, None, torch.float32, torch.float32, 0)
-    per_example, _ = trainer.compute_loss(
-        args, output, timesteps, None, torch.float32, torch.float32, 0, reduction="none"
-    )
+    per_example, _ = trainer.compute_loss(args, output, timesteps, None, torch.float32, torch.float32, 0, reduction="none")
 
     assert scalar.item() == pytest.approx(per_example.mean().item())
 
@@ -97,12 +93,7 @@ def test_reduction_none_with_weighting_scheme_is_per_example_not_batch_mean():
     weighting = compute_loss_weighting_for_sd3("sigma_sqrt", noise_scheduler, timesteps, timesteps.device, torch.float32)
     weighting_flat = weighting.flatten()
 
-    mse_per_example = torch.tensor(
-        [
-            torch.nn.functional.mse_loss(pred[i], target[i]).item()
-            for i in range(pred.shape[0])
-        ]
-    )
+    mse_per_example = torch.tensor([torch.nn.functional.mse_loss(pred[i], target[i]).item() for i in range(pred.shape[0])])
     expected = weighting_flat * mse_per_example
 
     assert per_example.shape == (2,)
