@@ -55,16 +55,32 @@ class LossContext:
     dit_dtype: torch.dtype
     network_dtype: torch.dtype
     global_step: int
+    reduction: str = "mean"
 
 
 def mse_loss(ctx: LossContext) -> tuple[torch.Tensor, dict[str, float]]:
-    """Default weighted MSE: SD3-style ``args.weighting_scheme``, then mean."""
+    """Default weighted MSE: SD3-style ``args.weighting_scheme``, then reduce.
+
+    ``ctx.reduction="mean"`` (default): reduce over every element, return a 0-d
+    scalar. ``"none"``: reduce only over non-batch dims, return a
+    ``(batch_size,)`` tensor of per-example losses (e.g. for best-of-K selection).
+    """
     weighting = compute_loss_weighting_for_sd3(
         ctx.args.weighting_scheme, ctx.noise_scheduler, ctx.timesteps, ctx.timesteps.device, ctx.dit_dtype
     )
     loss = torch.nn.functional.mse_loss(ctx.output.pred.to(ctx.network_dtype), ctx.output.target, reduction="none")
     if weighting is not None:
+        # `weighting` is always built as a `(batch_size, 1, 1, 1, 1)` tensor (see
+        # `compute_loss_weighting_for_sd3` / `get_sigmas`, hardcoded to n_dim=5), which
+        # only broadcasts correctly against a 5-dim `loss`. For architectures whose
+        # `DiTOutput.pred`/`target` are a different rank (e.g. 4-dim after squeezing),
+        # raw `loss * weighting` broadcasts as an accidental (B, B, ...) outer product
+        # instead of per-example elementwise weighting. Reshape to `loss`'s actual rank
+        # first so this is correct regardless of `loss.ndim`.
+        weighting = weighting.reshape(-1, *([1] * (loss.ndim - 1)))
         loss = loss * weighting
+    if ctx.reduction == "none":
+        return loss.mean(dim=tuple(range(1, loss.ndim))), {}
     return loss.mean(), {}
 
 

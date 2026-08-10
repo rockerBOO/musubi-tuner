@@ -1187,6 +1187,7 @@ class NetworkTrainer:
         dit_dtype: torch.dtype,
         network_dtype: torch.dtype,
         global_step: int,
+        reduction: str = "mean",
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Reduce a ``DiTOutput`` to a scalar loss + per-step metrics dict.
 
@@ -1204,6 +1205,14 @@ class NetworkTrainer:
         auxiliary loss only every N steps). ``loss_metrics`` defaults to empty;
         populate with named scalars for loss-decomposition logging
         (e.g. ``{"loss/gen": ..., "loss/rep": ...}``).
+
+        ``reduction="mean"`` (default): reduce over every element, return a
+        0-d scalar tensor. ``reduction="none"``: reduce only over non-batch
+        dims, return a ``(batch_size,)`` tensor of per-example losses — useful
+        for callers that need to compare or select among examples before the
+        final batch-level reduction (e.g. best-of-K sampling). Subclasses
+        overriding ``compute_loss`` are not required to support
+        ``reduction="none"`` unless they need per-example losses.
         """
         if self._resolved_loss_fn is None:
             # defensive fallback for direct calls (unit tests); real runs resolve
@@ -1220,6 +1229,7 @@ class NetworkTrainer:
             dit_dtype=dit_dtype,
             network_dtype=network_dtype,
             global_step=global_step,
+            reduction=reduction,
         )
         result = self._resolved_loss_fn(ctx)
         return normalize_loss_output(result)
