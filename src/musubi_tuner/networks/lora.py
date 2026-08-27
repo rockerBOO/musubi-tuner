@@ -581,14 +581,20 @@ class LoRANetwork(torch.nn.Module):
         # regex itself, e.g. a non-capturing group "(?:...)", doesn't break the split).
         self.rank_patterns: List[Tuple[re.Pattern, int, Optional[float]]] = []
         for entry in rank_pattern or []:
-            pattern_str, dim_str, alpha_str = entry.rsplit(":", 2)
+            try:
+                pattern_str, dim_str, alpha_str = entry.rsplit(":", 2)
+                pattern_dim = int(dim_str)
+                if pattern_dim < 0:
+                    raise ValueError(f"dim must be >= 0, got {pattern_dim}")
+                pattern_alpha = float(alpha_str) if alpha_str.strip() not in ("", "none", "null") else None
+            except ValueError as e:
+                raise ValueError(f"Invalid rank_pattern entry {entry!r}, expected '<regex>:<dim>:<alpha>': {e}") from e
+
             try:
                 compiled_pattern = re.compile(pattern_str)
             except re.error as e:
                 logger.error(f"Invalid rank_pattern regex '{pattern_str}': {e}")
                 continue
-            pattern_dim = int(dim_str)
-            pattern_alpha = float(alpha_str) if alpha_str.strip() not in ("", "none", "null") else None
             self.rank_patterns.append((compiled_pattern, pattern_dim, pattern_alpha))
 
         # create module instances

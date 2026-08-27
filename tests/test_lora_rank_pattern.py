@@ -3,7 +3,7 @@
 import logging
 
 import pytest
-import torch.nn as nn
+from torch import nn
 
 from musubi_tuner.networks.lora import LoRANetwork, create_network
 
@@ -66,14 +66,32 @@ def test_rank_pattern_colon_inside_regex_non_capturing_group():
 
 def test_rank_pattern_invalid_regex_is_skipped_not_raised(caplog):
     with caplog.at_level(logging.ERROR):
-        network = _make_network(
-            rank_pattern=["(unclosed:4:4", "^blocks\\.0\\.attn\\.wq$:2:2"]
-        )
+        network = _make_network(rank_pattern=["(unclosed:4:4", "^blocks\\.0\\.attn\\.wq$:2:2"])
     assert len(network.rank_patterns) == 1
     _, dim, alpha = network.rank_patterns[0]
     assert dim == 2
     assert alpha == 2.0
     assert "Invalid rank_pattern regex" in caplog.text
+
+
+def test_rank_pattern_malformed_entry_no_colons_raises():
+    with pytest.raises(ValueError, match=r"badentry.*<regex>:<dim>:<alpha>"):
+        _make_network(rank_pattern=["badentry"])
+
+
+def test_rank_pattern_malformed_entry_too_few_colons_raises():
+    with pytest.raises(ValueError, match=r"regex:4.*<regex>:<dim>:<alpha>"):
+        _make_network(rank_pattern=["regex:4"])
+
+
+def test_rank_pattern_non_numeric_dim_raises():
+    with pytest.raises(ValueError, match=r"\^a\$:x:4.*<regex>:<dim>:<alpha>"):
+        _make_network(rank_pattern=["^a$:x:4"])
+
+
+def test_rank_pattern_negative_dim_raises():
+    with pytest.raises(ValueError, match=r"\^a\$:-2:4.*<regex>:<dim>:<alpha>"):
+        _make_network(rank_pattern=["^a$:-2:4"])
 
 
 def test_create_network_literal_evals_rank_pattern_string():
@@ -86,7 +104,7 @@ def test_create_network_literal_evals_rank_pattern_string():
         vae=None,
         text_encoders=[],
         unet=nn.Module(),
-        rank_pattern="['^blocks\\\\.0\\\\.attn\\\\.wk$:2:2']",
+        rank_pattern=r"['^blocks\\.0\\.attn\\.wk$:2:2']",
     )
     assert len(network.rank_patterns) == 1
     compiled, dim, alpha = network.rank_patterns[0]
@@ -134,7 +152,7 @@ def test_rank_pattern_overrides_matched_module_only():
         vae=None,
         text_encoders=[],
         unet=_FakeUnet(n_blocks=2),
-        rank_pattern="['^blocks\\.0\\.attn\\.wk$:2:2']",
+        rank_pattern=r"['^blocks\\.0\\.attn\\.wk$:2:2']",
     )
     dims = _lora_dims_by_name(network)
     assert dims["lora_unet_blocks_0_attn_wk"] == (2, 2.0)
@@ -153,10 +171,7 @@ def test_rank_pattern_first_match_wins():
         vae=None,
         text_encoders=[],
         unet=_FakeUnet(n_blocks=1),
-        rank_pattern=(
-            "['^blocks\\.0\\.attn\\.wv$:2:2', "
-            "'^blocks\\.\\d+\\.attn\\.wv$:6:6']"
-        ),
+        rank_pattern=(r"['^blocks\\.0\\.attn\\.wv$:2:2', " r"'^blocks\\.\\d+\\.attn\\.wv$:6:6']"),
     )
     dims = _lora_dims_by_name(network)
     assert dims["lora_unet_blocks_0_attn_wv"] == (2, 2.0)
@@ -172,7 +187,7 @@ def test_rank_pattern_empty_alpha_falls_back_to_network_alpha():
         vae=None,
         text_encoders=[],
         unet=_FakeUnet(n_blocks=1),
-        rank_pattern="['^blocks\\.0\\.attn\\.wq$:5:']",
+        rank_pattern=r"['^blocks\\.0\\.attn\\.wq$:5:']",
     )
     dims = _lora_dims_by_name(network)
     assert dims["lora_unet_blocks_0_attn_wq"] == (5, 8.0)
@@ -188,7 +203,7 @@ def test_rank_pattern_dim_zero_skips_module():
         vae=None,
         text_encoders=[],
         unet=_FakeUnet(n_blocks=1),
-        rank_pattern="['^blocks\\.0\\.attn\\.wv$:0:']",
+        rank_pattern=r"['^blocks\\.0\\.attn\\.wv$:0:']",
     )
     dims = _lora_dims_by_name(network)
     assert "lora_unet_blocks_0_attn_wv" not in dims
@@ -205,7 +220,7 @@ def test_rank_pattern_matches_regex_with_non_capturing_group():
         vae=None,
         text_encoders=[],
         unet=_FakeUnet(n_blocks=1),
-        rank_pattern="['^blocks\\.0\\.(?:attn)\\.wv$:3:3']",
+        rank_pattern=r"['^blocks\\.0\\.(?:attn)\\.wv$:3:3']",
     )
     dims = _lora_dims_by_name(network)
     assert dims["lora_unet_blocks_0_attn_wv"] == (3, 3.0)

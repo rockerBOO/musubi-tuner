@@ -225,6 +225,54 @@ Only the modules of single blocks from the 10th / single blocksの10番目以降
 --network_args "exclude_patterns=[r'.*']" "include_patterns=[r'.*single_blocks\.\d{2}\.linear.*']"
 ```
 
+## Per-module rank/alpha override with rank_pattern / モジュールごとのrank/alphaを上書きするrank_pattern
+
+*This feature is highly experimental and the specification may change. / この機能は特に実験的なもので、仕様は変更される可能性があります。*
+
+*This is a `networks/lora.py`-only feature — LoHa/LoKr (`networks/loha.py`/`networks/lokr.py`) have their own separate `create_network` and do not currently support `rank_pattern`. / この機能は`networks/lora.py`のLoRAのみでサポートされています。LoHa/LoKr（`networks/loha.py`/`networks/lokr.py`）は独自の`create_network`を持っており、現時点では`rank_pattern`に対応していません。*
+
+By specifying `rank_pattern` with `--network_args`, you can override the LoRA `dim` (rank) and `alpha` on a per-module basis, matched by regular expression, independent of the network-wide `--network_dim`/`--network_alpha` (and `conv_dim`/`conv_alpha`).
+
+Specify the value as a list of strings, each in the form `'<regex>:<dim>:<alpha>'`, e.g. `"rank_pattern=['<regex>:<dim>:<alpha>', ...]"`. The same string works in a TOML dataset/training config as `network_args = [...]`.
+
+Each entry has exactly 3 colon-delimited fields. The entry is split from the right (`rsplit(":", 2)`), so a `:` inside the regex itself (for example a non-capturing group like `(?:...)`) is safe and will not break the split.
+
+- If the `alpha` field is left empty (`'<regex>:<dim>:'`), the module keeps its normal default alpha (from `--network_alpha` or `conv_alpha`) — it does not mean "no LoRA".
+- `dim=0` skips/excludes the matched module entirely (equivalent to removing LoRA from that module). This can also be used to force-include a module that wouldn't otherwise be targeted (e.g. an untargeted conv layer via `conv_dim`), but it cannot override a module already excluded by `exclude_patterns` — see the gotcha below.
+- Patterns are checked in list order, and the **first match wins**.
+- Patterns match against the module's dot-separated internal name (e.g. `blocks.0.attn.to_v`), the same convention used by `exclude_patterns`/`include_patterns` above, and matching is a complete match, not a partial match.
+
+**Gotcha:** `exclude_patterns` is evaluated *before* `rank_pattern`. A module excluded by `exclude_patterns` never reaches the `rank_pattern` check, so `rank_pattern` cannot force-include a module that `exclude_patterns` already excluded. This matters in practice because some architecture wrappers inject default excludes automatically — for example, Wan's `lora_wan.py` excludes `.*(patch_embedding|text_embedding|time_embedding|time_projection|norm|head).*` by default. A `rank_pattern` targeting e.g. `.*norm.*` on Wan would silently never match anything, because those modules are already filtered out by `exclude_patterns` first.
+
+As with `exclude_patterns`/`include_patterns`, prefer the raw-string form (`r'...'`) for the regex inside the list literal, to avoid Python `DeprecationWarning`s on invalid escape sequences like `\.`.
+
+<details>
+<summary>日本語</summary>
+
+`--network_args`で`rank_pattern`を指定することで、正規表現でマッチさせたモジュールごとにLoRAの`dim`（rank）と`alpha`を、ネットワーク全体の`--network_dim`/`--network_alpha`（および`conv_dim`/`conv_alpha`）とは独立して上書きできます。
+
+値は、`'<regex>:<dim>:<alpha>'`形式の文字列のリストで指定します。例: `"rank_pattern=['<regex>:<dim>:<alpha>', ...]"`。同じ文字列はTOML設定でも`network_args = [...]`として使用できます。
+
+各エントリはコロン区切りでちょうど3つのフィールドを持ちます。右側から分割される（`rsplit(":", 2)`）ため、正規表現自体に含まれる`:`（例えば非捕捉グループ`(?:...)`）があっても分割が壊れることはありません。
+
+- `alpha`フィールドを空にした場合（`'<regex>:<dim>:'`）、そのモジュールは通常のデフォルトalpha（`--network_alpha`または`conv_alpha`）を使用します。「LoRAなし」を意味するわけではありません。
+- `dim=0`は、マッチしたモジュールを完全にスキップ（除外）します。これは、通常は対象とならないモジュール（例えば`conv_dim`で対象とならないconv層）を強制的に含めるためにも使えますが、`exclude_patterns`で既に除外されているモジュールを上書きすることはできません（下記の注意点を参照）。
+- パターンはリストの順序でチェックされ、**最初にマッチしたものが優先されます**。
+- パターンは、上記の`exclude_patterns`/`include_patterns`と同じ規則で、モジュールのドット区切りの内部名（例: `blocks.0.attn.to_v`）に対して完全一致でマッチします。
+
+**注意点:** `exclude_patterns`は`rank_pattern`より先に評価されます。`exclude_patterns`で除外されたモジュールは`rank_pattern`のチェックに到達しないため、`rank_pattern`は`exclude_patterns`で既に除外されたモジュールを強制的に含めることはできません。これは実際に重要な意味を持ちます。一部のアーキテクチャラッパーはデフォルトの除外パターンを自動的に追加するためです。例えば、Wanの`lora_wan.py`はデフォルトで`.*(patch_embedding|text_embedding|time_embedding|time_projection|norm|head).*`を除外します。Wanで`.*norm.*`を対象とする`rank_pattern`を指定しても、これらのモジュールは`exclude_patterns`で先に除外されているため、何にもマッチしません。
+
+`exclude_patterns`/`include_patterns`と同様に、リストリテラル内の正規表現には、`\.`のような無効なエスケープシーケンスによるPythonの`DeprecationWarning`を避けるため、raw文字列形式（`r'...'`）を推奨します。
+</details>
+
+### Example / 記述例
+
+Give the `wk`/`wq` attention projections rank 4 while leaving everything else at the network default (e.g. `--network_dim 16`) / `wk`/`wq`のattention projectionのみrank 4とし、それ以外はネットワークのデフォルト（例: `--network_dim 16`）のままにする場合:
+
+```bash
+--network_args "rank_pattern=[r'.*attn\.wk$:4:4', r'.*attn\.wq$:4:4']"
+```
+
 ## Save and view logs in TensorBoard format / TensorBoard形式のログの保存と参照
 
 Specify the folder to save the logs with the `--logging_dir` option. Logs in TensorBoard format will be saved.
