@@ -655,6 +655,13 @@ class LoRANetwork(torch.nn.Module):
                                     dim = self.conv_lora_dim
                                     alpha = self.conv_alpha
 
+                                # regex rank/alpha override, first match in list order wins
+                                for compiled_pattern, pattern_dim, pattern_alpha in self.rank_patterns:
+                                    if compiled_pattern.fullmatch(original_name):
+                                        dim = pattern_dim
+                                        alpha = pattern_alpha if pattern_alpha is not None else alpha
+                                        break
+
                             if dim is None or dim == 0:
                                 # skipした情報を出力
                                 if is_linear or is_conv2d_1x1 or is_conv3d_1x1 or (self.conv_lora_dim is not None):
