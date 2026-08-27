@@ -7,7 +7,7 @@ import ast
 import math
 import os
 import re
-from typing import Any, Dict, List, Optional, Type, Union
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 from transformers import CLIPTextModel
 import torch
 import torch.nn as nn
@@ -427,7 +427,10 @@ def create_network(
         else:
             conv_alpha = float(conv_alpha)
 
-    # TODO generic rank/dim setting with regular expression
+    # per-module rank/alpha override by regex: rank_pattern=['<regex>:<dim>:<alpha>', ...]
+    rank_pattern = kwargs.get("rank_pattern", None)
+    if rank_pattern is not None and isinstance(rank_pattern, str):
+        rank_pattern = ast.literal_eval(rank_pattern)
 
     # rank/module dropout
     rank_dropout = kwargs.get("rank_dropout", None)
@@ -471,6 +474,7 @@ def create_network(
         module_kwargs=module_kwargs,
         exclude_patterns=exclude_patterns,
         include_patterns=include_patterns,
+        rank_pattern=rank_pattern,
         verbose=verbose,
     )
 
@@ -509,6 +513,7 @@ class LoRANetwork(torch.nn.Module):
         modules_alpha: Optional[Dict[str, int]] = None,
         exclude_patterns: Optional[List[str]] = None,
         include_patterns: Optional[List[str]] = None,
+        rank_pattern: Optional[List[str]] = None,
         verbose: Optional[bool] = False,
     ) -> None:
         super().__init__()
@@ -563,6 +568,21 @@ class LoRANetwork(torch.nn.Module):
                     logger.error(f"Invalid include pattern '{pattern}': {e}")
                     continue
                 include_re_patterns.append(re_pattern)
+
+        # per-module rank/alpha override by regex, first match in list order wins.
+        # each entry is "regex:dim:alpha" (rsplit from the right so a ':' inside the
+        # regex itself, e.g. a non-capturing group "(?:...)", doesn't break the split).
+        self.rank_patterns: List[Tuple[re.Pattern, int, Optional[float]]] = []
+        for entry in rank_pattern or []:
+            pattern_str, dim_str, alpha_str = entry.rsplit(":", 2)
+            try:
+                compiled_pattern = re.compile(pattern_str)
+            except re.error as e:
+                logger.error(f"Invalid rank_pattern regex '{pattern_str}': {e}")
+                continue
+            pattern_dim = int(dim_str)
+            pattern_alpha = float(alpha_str) if alpha_str.strip() not in ("", "none", "null") else None
+            self.rank_patterns.append((compiled_pattern, pattern_dim, pattern_alpha))
 
         # create module instances
         def create_modules(
