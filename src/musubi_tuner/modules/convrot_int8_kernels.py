@@ -155,11 +155,16 @@ def quantize_int8_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 def quantize_int8_convrot_weight(weight: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Offline ConvRot weight rotation followed by row-wise INT8 quantization.
 
+    The rotation is computed in float32 regardless of the weight dtype: rotating in
+    bf16 loses enough precision to shift ~9% of the int8 codes by ±1-2, while fp32
+    rotation reproduces ComfyUI's published pre-quantized checkpoints bit-exactly
+    (verified against the MiniMax-H3 INT8 ConvRot distribution).
+
     Returns:
         Tuple of (rotated quantized weight int8 [N, K], scale float32 [N, 1]).
     """
-    h = _build_hadamard(group_size, device=weight.device, dtype=weight.dtype)
-    weight_rot = _rotate_weight(weight, h, group_size)
+    h = _build_hadamard(group_size, device=weight.device, dtype=torch.float32)
+    weight_rot = _rotate_weight(weight.to(torch.float32), h, group_size)
     return quantize_int8_rowwise(weight_rot)
 
 
@@ -185,8 +190,10 @@ if HAS_TRITON:
         block_size: tl.constexpr,
         input_dtype_code: tl.constexpr,
     ):
-        # Row index we are processing
-        row_idx = tl.program_id(0)
+        # Row index we are processing. Promote to int64 before the stride multiply:
+        # H3 packs video+audio+text into one ~90k-row sequence, so row*cols can
+        # exceed int32 (Triton wraps silently, corrupting the tail of the tensor).
+        row_idx = tl.program_id(0).to(tl.int64)
 
         # Pointers to the start of the row
         x_row_ptr = x_ptr + row_idx * n_elements
@@ -308,7 +315,10 @@ if HAS_TRITON:
         offs_bn = (pid_n * block_n + tl.arange(0, block_n)) % n
         offs_k = tl.arange(0, block_k)
 
-        a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        # row * stride must be int64: at H3 scale m*stride_am and m*stride_cm exceed
+        # int32 (e.g. fc1 output m~90k x n=28672), and Triton wraps i32 silently
+        offs_am_i64 = offs_am.to(tl.int64)
+        a_ptrs = a_ptr + (offs_am_i64[:, None] * stride_am + offs_k[None, :] * stride_ak)
         b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
         # 2. Main Loop (Accumulate in Int32)
@@ -339,7 +349,7 @@ if HAS_TRITON:
             c = c + bias[None, :]
 
         # 4. Store Result
-        c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]
+        c_ptrs = c_ptr + stride_cm * offs_am_i64[:, None] + stride_cn * offs_bn[None, :]
         c_mask = (offs_am[:, None] < m) & (offs_bn[None, :] < n)
         tl.store(c_ptrs, c, mask=c_mask)
 
@@ -401,7 +411,10 @@ if HAS_TRITON:
         offs_bn = (pid_n * block_n + tl.arange(0, block_n)) % n
         offs_k = tl.arange(0, block_k)
 
-        a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        # row * stride must be int64: at H3 scale m*stride_am and m*stride_cm exceed
+        # int32 (e.g. fc1 output m~90k x n=28672), and Triton wraps i32 silently
+        offs_am_i64 = offs_am.to(tl.int64)
+        a_ptrs = a_ptr + (offs_am_i64[:, None] * stride_am + offs_k[None, :] * stride_ak)
         b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
         # 2. Main Loop (Accumulate in Int32)
@@ -427,7 +440,7 @@ if HAS_TRITON:
             c = c + bias[None, :]
 
         # 4. Store Result
-        c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]
+        c_ptrs = c_ptr + stride_cm * offs_am_i64[:, None] + stride_cn * offs_bn[None, :]
         c_mask = (offs_am[:, None] < m) & (offs_bn[None, :] < n)
         tl.store(c_ptrs, c, mask=c_mask)
 

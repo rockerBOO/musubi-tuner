@@ -150,6 +150,8 @@ class LoKrModule(torch.nn.Module):
         self.dropout = dropout
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
+        # honored by the training forward too, so set_enabled(False) yields the frozen base
+        self.enabled = True
 
     def apply_to(self):
         self.org_forward = self.org_module.forward
@@ -166,6 +168,9 @@ class LoKrModule(torch.nn.Module):
         return make_kron(w1, w2, self.scale)
 
     def forward(self, x):
+        if not self.enabled:
+            return self.org_forward(x)
+
         org_forwarded = self.org_forward(x)
 
         # module dropout
@@ -205,7 +210,6 @@ class LoKrInfModule(LoKrModule):
         super().__init__(lora_name, org_module, multiplier, lora_dim, alpha, factor=factor, lokr_shapes=lokr_shapes)
 
         self.org_module_ref = [org_module]
-        self.enabled = True
         self.network: lora_module.LoRANetwork = None
 
     def set_network(self, network):
