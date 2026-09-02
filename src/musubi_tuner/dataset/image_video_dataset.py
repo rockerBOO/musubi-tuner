@@ -23,6 +23,8 @@ import logging
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+EMPTY_CAPTION_CACHE_KEY = "___empty_caption_dropout___"
+
 from musubi_tuner.dataset.architectures import *  # noqa: F401,F403
 from musubi_tuner.dataset.architectures import (  # explicit imports for local use
     ARCHITECTURE_FLUX_2_DEV,
@@ -63,6 +65,8 @@ class ItemInfo:
         self.content = content
         self.latent_cache_path = latent_cache_path
         self.text_encoder_output_cache_path: Optional[str] = None
+        self.caption_dropout_rate: float = 0.0
+        self.empty_text_encoder_output_cache_path: Optional[str] = None
 
         # np.ndarray for video, list[np.ndarray] for image with multiple controls
         self.control_content: Optional[Union[np.ndarray, list[np.ndarray]]] = None
@@ -128,6 +132,7 @@ class BaseDataset(torch.utils.data.Dataset):
         cache_directory: Optional[str] = None,
         debug_dataset: bool = False,
         architecture: str = "no_default",
+        caption_dropout_rate: float = 0.0,
     ):
         self.resolution = resolution
         self.caption_extension = caption_extension
@@ -138,6 +143,7 @@ class BaseDataset(torch.utils.data.Dataset):
         self.cache_directory = cache_directory
         self.debug_dataset = debug_dataset
         self.architecture = architecture
+        self.caption_dropout_rate = caption_dropout_rate
         self.seed = None
         self.current_epoch = 0
         self.shared_epoch = None
@@ -182,6 +188,15 @@ class BaseDataset(torch.utils.data.Dataset):
         basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
         assert self.cache_directory is not None, "cache_directory is required / cache_directoryは必須です"
         return os.path.join(self.cache_directory, f"{basename}_{self.architecture}_te.safetensors")
+
+    def get_empty_text_encoder_output_cache_path(self) -> str:
+        assert self.cache_directory is not None, "cache_directory is required / cache_directoryは必須です"
+        return os.path.join(self.cache_directory, f"{EMPTY_CAPTION_CACHE_KEY}_{self.architecture}_te.safetensors")
+
+    def get_empty_caption_item_info(self) -> ItemInfo:
+        item_info = ItemInfo(EMPTY_CAPTION_CACHE_KEY, "", (0, 0), (0, 0))
+        item_info.text_encoder_output_cache_path = self.get_empty_text_encoder_output_cache_path()
+        return item_info
 
     def retrieve_latent_cache_batches(self, num_workers: int):
         raise NotImplementedError
@@ -300,6 +315,7 @@ class ImageDataset(BaseDataset):
         control_resolution: Optional[Tuple[int, int]] = None,
         debug_dataset: bool = False,
         architecture: str = "no_default",
+        caption_dropout_rate: float = 0.0,
     ):
         super(ImageDataset, self).__init__(
             resolution,
@@ -311,6 +327,7 @@ class ImageDataset(BaseDataset):
             cache_directory,
             debug_dataset,
             architecture,
+            caption_dropout_rate,
         )
         self.image_directory = image_directory
         self.image_jsonl_file = image_jsonl_file
@@ -558,6 +575,16 @@ class ImageDataset(BaseDataset):
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
         bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture)
 
+        empty_te_cache_path = None
+        if self.caption_dropout_rate > 0:
+            empty_te_cache_path = self.get_empty_text_encoder_output_cache_path()
+            if not os.path.exists(empty_te_cache_path):
+                raise FileNotFoundError(
+                    f"caption_dropout_rate is set to {self.caption_dropout_rate} but the empty-caption cache file "
+                    f"was not found: {empty_te_cache_path}. Re-run the *_cache_text_encoder_outputs.py script for "
+                    f"this dataset with caption_dropout_rate set in the dataset config to generate it."
+                )
+
         # glob cache files
         latent_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
 
@@ -607,6 +634,9 @@ class ImageDataset(BaseDataset):
 
             item_info = ItemInfo(item_key, "", image_size, bucket_reso, latent_cache_path=cache_file)
             item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
+            if empty_te_cache_path is not None:
+                item_info.caption_dropout_rate = self.caption_dropout_rate
+                item_info.empty_text_encoder_output_cache_path = empty_te_cache_path
 
             bucket = bucketed_item_info.get(bucket_reso, [])
             for _ in range(self.num_repeats):
@@ -664,6 +694,7 @@ class VideoDataset(BaseDataset):
         debug_dataset: bool = False,
         architecture: str = "no_default",
         audio_spec: Optional["AudioSpec"] = None,
+        caption_dropout_rate: float = 0.0,
     ):
         super(VideoDataset, self).__init__(
             resolution,
@@ -675,6 +706,7 @@ class VideoDataset(BaseDataset):
             cache_directory,
             debug_dataset,
             architecture,
+            caption_dropout_rate,
         )
         self.video_directory = video_directory
         self.video_jsonl_file = video_jsonl_file
@@ -758,6 +790,14 @@ class VideoDataset(BaseDataset):
         self.batch_manager = None
         self.num_train_items = 0
         self.has_control = self.datasource.has_control
+
+    def get_empty_caption_item_info(self) -> ItemInfo:
+        # Override base implementation to mark this as a video item (frame_count > 1), so that
+        # architecture-specific consumers (e.g. Kandinsky5's content-type template selection) treat
+        # the empty-caption embedding as belonging to a video dataset, not an image dataset.
+        item_info = super().get_empty_caption_item_info()
+        item_info.frame_count = 2
+        return item_info
 
     def get_metadata(self):
         metadata = super().get_metadata()
@@ -962,6 +1002,16 @@ class VideoDataset(BaseDataset):
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
         bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture)
 
+        empty_te_cache_path = None
+        if self.caption_dropout_rate > 0:
+            empty_te_cache_path = self.get_empty_text_encoder_output_cache_path()
+            if not os.path.exists(empty_te_cache_path):
+                raise FileNotFoundError(
+                    f"caption_dropout_rate is set to {self.caption_dropout_rate} but the empty-caption cache file "
+                    f"was not found: {empty_te_cache_path}. Re-run the *_cache_text_encoder_outputs.py script for "
+                    f"this dataset with caption_dropout_rate set in the dataset config to generate it."
+                )
+
         # glob cache files
         latent_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
 
@@ -993,6 +1043,9 @@ class VideoDataset(BaseDataset):
             bucket_reso = (*bucket_reso, frame_count)
             item_info = ItemInfo(item_key, "", image_size, bucket_reso, frame_count=frame_count, latent_cache_path=cache_file)
             item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
+            if empty_te_cache_path is not None:
+                item_info.caption_dropout_rate = self.caption_dropout_rate
+                item_info.empty_text_encoder_output_cache_path = empty_te_cache_path
 
             bucket = bucketed_item_info.get(bucket_reso, [])
             for _ in range(self.num_repeats):
