@@ -167,7 +167,9 @@ def test_load_flow_model_applies_both_patches_for_mixed_nvfp4_convrot(monkeypatc
     path = _make_tiny_mixed_artifact(tmp_path)
     captured = {}
 
-    def fake_nvfp4_patch(model, sd, shapes, int8_mods, use_scaled_mm=False, training=False, calc_device=None, columnwise_chunk_rows=1024):
+    def fake_nvfp4_patch(
+        model, sd, shapes, int8_mods, use_scaled_mm=False, training=False, calc_device=None, columnwise_chunk_rows=1024
+    ):
         captured["nvfp4_shapes"] = dict(shapes)
         return model
 
