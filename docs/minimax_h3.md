@@ -341,9 +341,9 @@ The published quantization scope is the five Linears in each of the 50 main DiT 
 
 Some published artifacts mix NVFP4 and ConvRot INT8 within the same transformer checkpoint: each Linear's format is declared per-module by its own `comfy_quant` spec, rather than by a single scheme for the whole file. These mixed checkpoints are detected automatically from their tensor structure — pass the file as `--dit` and no extra flag is needed — and are supported for both LoRA training and generation. A pure NVFP4-only transformer (no co-resident ConvRot INT8 Linears) is not supported and is rejected at load time.
 
-**Requires `--block_swap_h2d_only` when using `--blocks_to_swap`.** As with Krea 2's `--nvfp4` (see the NVFP4 section in `docs/krea2.md`), NVFP4 training keeps an extra backward-only copy of each frozen NVFP4 weight that the default block-swap offloader can't handle correctly; `--blocks_to_swap N` on a mixed checkpoint without `--block_swap_h2d_only` is rejected at startup.
+**Training.** Requires `--block_swap_h2d_only` when using `--blocks_to_swap`. As with Krea 2's `--nvfp4` (see the NVFP4 section in `docs/krea2.md`), NVFP4 training keeps an extra backward-only copy of each frozen NVFP4 weight that the default block-swap offloader can't handle correctly; `--blocks_to_swap N` on a mixed checkpoint without `--block_swap_h2d_only` is rejected at startup. Load-time LoRA merge (`--lora_weight`) is not supported against an NVFP4-containing base: NVFP4 weights cannot be re-quantized after a merge. Train a LoRA network against the frozen base instead (the normal LoRA training flow), or merge against the original BF16 weights if one is available.
 
-**No load-time LoRA merge.** `--lora_weight` is not supported against an NVFP4-containing base: NVFP4 weights cannot be re-quantized after a merge. Train a LoRA network against the frozen base instead (the normal LoRA training flow), or merge against the original BF16 weights if one is available.
+**Generation.** With `--lora_weight`, a mixed checkpoint attaches each LoRA as a runtime additive branch with its own multiplier for the sampling lifetime — the quantized base tensors are never modified or requantized, so LoRA generation no longer requires downloading the BF16 checkpoint.
 
 ## NVFP4 Text Encoder
 
