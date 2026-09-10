@@ -299,3 +299,93 @@ def test_prequantized_module_groupsizes_follow_the_file_spec(tmp_path):
     assert quantizer.module_groupsizes == {"blocks.0.mlp.fc1": 64}
     assert set(state) == {"blocks.0.mlp.fc1.weight", "blocks.0.mlp.fc1.scale_weight"}
     assert state["blocks.0.mlp.fc1.weight"].dtype == torch.int8
+
+
+def _nvfp4_comfy_quant_tensor() -> torch.Tensor:
+    return torch.tensor(list(json.dumps({"format": "nvfp4"}).encode("utf-8")), dtype=torch.uint8)
+
+
+def _save_mixed_prequantized_checkpoint(path, bf16_state: dict) -> None:
+    """Quantize attn.qkv_proj to ConvRot INT8 and mlp.fc1/fc2 to NVFP4; everything else
+    (including attn.out_proj and adaln_proj) stays BF16 -- matches the real published
+    ComfyUI mixed artifact's layout for the quantized blocks."""
+    from musubi_tuner.modules.nvfp4_utils import _quantize_nvfp4_2d
+
+    out = dict(bf16_state)
+    for key in list(bf16_state.keys()):
+        if ".attn.qkv_proj.weight" in key:
+            weight = out.pop(key)
+            wq, ws, groupsize = quantize_weight_convrot(key, weight, (256,))
+            module_path = key[: -len(".weight")]
+            out[key] = wq
+            out[f"{module_path}.weight_scale"] = ws
+            out[f"{module_path}.comfy_quant"] = _comfy_quant_tensor(groupsize)
+        elif (".mlp.fc1.weight" in key) or (".mlp.fc2.weight" in key):
+            weight = out.pop(key)
+            packed, block_scale, tensor_scale, _ = _quantize_nvfp4_2d(weight)
+            module_path = key[: -len(".weight")]
+            out[key] = packed
+            out[f"{module_path}.weight_scale"] = block_scale
+            out[f"{module_path}.weight_scale_2"] = tensor_scale
+            out[f"{module_path}.comfy_quant"] = _nvfp4_comfy_quant_tensor()
+    save_file(out, str(path))
+
+
+def test_load_h3_transformer_detects_and_loads_mixed_nvfp4_convrot_checkpoint(tmp_path, monkeypatch):
+    config = _convrot_config(num_layers=1)
+    path = tmp_path / "mixed.safetensors"
+    bf16_state = _save_tiny_bf16_checkpoint(tmp_path / "unused_bf16.safetensors", config)
+    _save_mixed_prequantized_checkpoint(path, bf16_state)
+
+    import musubi_tuner.minimax_h3.model as h3_model
+    from musubi_tuner.minimax_h3.model import load_h3_transformer
+
+    # the tiny test config doesn't match the published-architecture field values that
+    # parse_h3_transformer_config validates against; classification itself is exercised
+    # elsewhere (test_minimax_h3_model.py), so bypass it here the same way those tests do.
+    monkeypatch.setattr(h3_model, "parse_h3_transformer_config", lambda _metadata, **_kwargs: config)
+
+    model = load_h3_transformer(path, device="cpu")
+
+    assert model.is_convrot_int8 is True
+    assert model.is_nvfp4 is True
+
+
+def test_load_h3_transformer_rejects_pure_nvfp4_without_convrot(tmp_path):
+    config = _convrot_config(num_layers=1)
+    bf16_state = _save_tiny_bf16_checkpoint(tmp_path / "unused_bf16.safetensors", config)
+    from musubi_tuner.modules.nvfp4_utils import _quantize_nvfp4_2d
+
+    out = dict(bf16_state)
+    key = "blocks.0.mlp.fc1.weight"
+    weight = out.pop(key)
+    packed, block_scale, tensor_scale, _ = _quantize_nvfp4_2d(weight)
+    module_path = key[: -len(".weight")]
+    out[key] = packed
+    out[f"{module_path}.weight_scale"] = block_scale
+    out[f"{module_path}.weight_scale_2"] = tensor_scale
+    out[f"{module_path}.comfy_quant"] = _nvfp4_comfy_quant_tensor()
+    path = tmp_path / "nvfp4_only.safetensors"
+    save_file(out, str(path))
+
+    from musubi_tuner.minimax_h3.model import load_h3_transformer
+
+    with pytest.raises(ValueError, match="co-resident ConvRot"):
+        load_h3_transformer(path, device="cpu")
+
+
+def test_load_h3_transformer_rejects_lora_weights_with_nvfp4(tmp_path, monkeypatch):
+    config = _convrot_config(num_layers=1)
+    path = tmp_path / "mixed.safetensors"
+    bf16_state = _save_tiny_bf16_checkpoint(tmp_path / "unused_bf16.safetensors", config)
+    _save_mixed_prequantized_checkpoint(path, bf16_state)
+
+    import musubi_tuner.minimax_h3.model as h3_model
+    from musubi_tuner.minimax_h3.model import load_h3_transformer
+
+    # see test_load_h3_transformer_detects_and_loads_mixed_nvfp4_convrot_checkpoint: the tiny
+    # test config doesn't pass published-architecture metadata validation, so bypass it here too.
+    monkeypatch.setattr(h3_model, "parse_h3_transformer_config", lambda _metadata, **_kwargs: config)
+
+    with pytest.raises(ValueError, match="NVFP4"):
+        load_h3_transformer(path, device="cpu", lora_weights=[{}], lora_multipliers=[1.0])
