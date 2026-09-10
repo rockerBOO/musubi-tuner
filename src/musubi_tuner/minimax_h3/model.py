@@ -1193,6 +1193,7 @@ def _load_h3_transformer_mixed(
     disable_mmap: bool,
     prune_hooks: WeightTransformHooks | None = None,
     prune_state: dict[str, torch.Tensor] | None = None,
+    training: bool = True,
 ) -> MiniMaxH3Model:
     """Load a transformer whose Linears mix ConvRot INT8 and NVFP4 (each module's format
     declared in its own ``.comfy_quant`` spec), via
@@ -1209,7 +1210,7 @@ def _load_h3_transformer_mixed(
 
     sd, nvfp4_quantizer, convrot_quantizer = load_nvfp4_convrot_mixed_state_dict(
         [str(path) for path in files],
-        convrot_target_keys=H3_CONVROT_INT8_TARGET_KEYS,
+        convrot_target_keys=[],  # prequantized-only: no dynamic quantization in mixed mode
         convrot_exclude_keys=H3_CONVROT_INT8_EXCLUDE_KEYS,
         convrot_allowed_groupsizes=H3_CONVROT_INT8_ALLOWED_GROUPSIZES,
         calc_device=quant_device,
@@ -1225,11 +1226,11 @@ def _load_h3_transformer_mixed(
         nvfp4_quantizer,
         convrot_quantizer,
         convrot_bwd_mode=bwd_mode,
-        nvfp4_training=True,
+        nvfp4_training=training,
         nvfp4_calc_device=quant_device,
         nvfp4_columnwise_chunk_rows=1024,
     )
-    for key in sd.keys():
+    for key in sd:
         if sd[key].dtype == torch.float16:
             sd[key] = sd[key].to(torch.bfloat16)
         if device.type != "cpu":
@@ -1315,6 +1316,7 @@ def load_h3_transformer(
     lora_weights: list[dict] | None = None,
     lora_multipliers: list[float] | None = None,
     prune_adaln: bool = False,
+    training: bool = True,
 ) -> MiniMaxH3Model:
     if dtype != torch.bfloat16:
         raise ValueError("MiniMax-H3 accepts only BF16 transformer checkpoints")
@@ -1376,6 +1378,7 @@ def load_h3_transformer(
             disable_mmap=disable_mmap,
             prune_hooks=prune_hooks,
             prune_state=prune_state,
+            training=training,
         )
     if use_convrot_int8:
         device = torch.device(device)

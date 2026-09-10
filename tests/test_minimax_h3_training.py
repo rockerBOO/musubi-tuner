@@ -17,9 +17,6 @@ sys.path.insert(0, str(ROOT / "src"))
 from musubi_tuner.hv_train_network import setup_parser_common
 from musubi_tuner.minimax_h3.model import MiniMaxH3Config, MiniMaxH3Model
 from musubi_tuner.minimax_h3.packing import FRAME_RESCALE, H3ReferenceGeometry, H3VideoGeometry, build_h3_layout
-from musubi_tuner.modules.convrot_int8_kernels import quantize_int8_convrot_weight
-from musubi_tuner.modules.convrot_int8_utils import apply_convrot_int8_monkey_patch
-from musubi_tuner.modules.nvfp4_utils import nvfp4_scaled_mm_available
 from musubi_tuner.minimax_h3_train_network import (
     H3SamplingResources,
     MiniMaxH3NetworkTrainer,
@@ -29,9 +26,12 @@ from musubi_tuner.minimax_h3_train_network import (
     _prediction_geometry_log,
     minimax_h3_setup_parser,
 )
-from musubi_tuner.training.sampling_prompts import line_to_prompt_dict
+from musubi_tuner.modules.convrot_int8_kernels import quantize_int8_convrot_weight
+from musubi_tuner.modules.convrot_int8_utils import apply_convrot_int8_monkey_patch
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
+from musubi_tuner.modules.nvfp4_utils import nvfp4_scaled_mm_available
 from musubi_tuner.networks import lora_minimax_h3
+from musubi_tuner.training.sampling_prompts import line_to_prompt_dict
 from musubi_tuner.training.trainer_base import DiTOutput
 
 
@@ -1587,9 +1587,9 @@ def test_h3_lora_gets_gradients_over_frozen_int8_convrot_base_with_checkpointing
     reason="CUDA + torch 2.10+ scaled_mm/float4_e2m1fn_x2 required (NVFP4 training forward has no CPU backward path)",
 )
 def test_h3_lora_gets_gradients_over_frozen_mixed_nvfp4_convrot_base():
+    from musubi_tuner.modules.convrot_int8_utils import ConvRotInt8Quantizer
     from musubi_tuner.modules.mixed_quant_utils import apply_nvfp4_convrot_mixed_monkey_patch
-    from musubi_tuner.modules.nvfp4_utils import NvFp4Quantizer, block_has_nvfp4_patched_linear
-    from musubi_tuner.modules.convrot_int8_utils import ConvRotInt8Quantizer, block_has_convrot_patched_linear
+    from musubi_tuner.modules.nvfp4_utils import NvFp4Quantizer
 
     model = _tiny_model(num_layers=1)
     convrot_target_paths = ("blocks.0.attn.qkv_proj",)
