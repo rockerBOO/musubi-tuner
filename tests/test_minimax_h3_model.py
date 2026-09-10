@@ -273,6 +273,39 @@ def test_published_transformer_metadata_is_parsed_strictly():
         )
 
 
+def test_h3_transformer_allow_nvfp4_unblocks_nvfp4_marker():
+    released = {
+        "hidden_size": 5376,
+        "num_layers": 50,
+        "token_refiner_num_layers": 2,
+        "num_attention_heads": 56,
+        "attention_head_dim": 128,
+        "ffn_hidden_size": 14336,
+        "latents_dim": 24,
+        "audio_latents_dim": 32,
+        "patch_size": [1, 2, 2],
+        "text_dim": 5120,
+        "timestep_input_dim": 256,
+        "time_embed_hidden_size": 5376,
+        "time_embed_dim": 2688,
+        "adaln_out_features": 96768,
+        "final_adaln_out_features": 10752,
+        "rope_inv_freq_len": 16,
+        "norm_eps": 1e-5,
+        "qk_norm_eps": 1e-5,
+        "final_norm_eps": 1e-5,
+        "image_model": "minimax_h3",
+    }
+
+    nvfp4_metadata = {
+        "config": json.dumps({"transformer": released}),
+        "format": "nvfp4",
+    }
+    with pytest.raises(ValueError, match="not supported"):
+        parse_h3_transformer_config(nvfp4_metadata)
+    assert parse_h3_transformer_config(nvfp4_metadata, allow_convrot_int8=True, allow_nvfp4=True) == MiniMaxH3Config()
+
+
 def test_tiny_model_rejects_batch_size_above_one_in_r1():
     model = _tiny_model()
 
