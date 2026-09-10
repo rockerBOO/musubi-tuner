@@ -19,6 +19,7 @@ from musubi_tuner.minimax_h3.model import MiniMaxH3Config, MiniMaxH3Model
 from musubi_tuner.minimax_h3.packing import FRAME_RESCALE, H3ReferenceGeometry, H3VideoGeometry, build_h3_layout
 from musubi_tuner.modules.convrot_int8_kernels import quantize_int8_convrot_weight
 from musubi_tuner.modules.convrot_int8_utils import apply_convrot_int8_monkey_patch
+from musubi_tuner.modules.nvfp4_utils import nvfp4_scaled_mm_available
 from musubi_tuner.minimax_h3_train_network import (
     H3SamplingResources,
     MiniMaxH3NetworkTrainer,
@@ -1446,12 +1447,12 @@ def test_h3_metadata_omits_the_audio_fraction_until_a_batch_has_been_observed():
 
 def _tiny_model(num_layers: int = 2):
     config = MiniMaxH3Config(
-        hidden_size=16,
+        hidden_size=32,
         num_layers=num_layers,
         token_refiner_num_layers=1,
         num_attention_heads=2,
-        attention_head_dim=8,
-        ffn_hidden_size=24,
+        attention_head_dim=16,
+        ffn_hidden_size=32,
         text_dim=12,
         timestep_input_dim=4,
         time_embed_hidden_size=16,
@@ -1579,6 +1580,91 @@ def test_h3_lora_gets_gradients_over_frozen_int8_convrot_base_with_checkpointing
     gradients = [parameter.grad for parameter in network.parameters()]
     assert any(gradient is not None and torch.count_nonzero(gradient) for gradient in gradients)
     assert all(model.get_submodule(path).weight.grad is None for path in target_paths)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and nvfp4_scaled_mm_available()),
+    reason="CUDA + torch 2.10+ scaled_mm/float4_e2m1fn_x2 required (NVFP4 training forward has no CPU backward path)",
+)
+def test_h3_lora_gets_gradients_over_frozen_mixed_nvfp4_convrot_base():
+    from musubi_tuner.modules.mixed_quant_utils import apply_nvfp4_convrot_mixed_monkey_patch
+    from musubi_tuner.modules.nvfp4_utils import NvFp4Quantizer, block_has_nvfp4_patched_linear
+    from musubi_tuner.modules.convrot_int8_utils import ConvRotInt8Quantizer, block_has_convrot_patched_linear
+
+    model = _tiny_model(num_layers=1)
+    convrot_target_paths = ("blocks.0.attn.qkv_proj",)
+    nvfp4_target_paths = ("blocks.0.mlp.fc1", "blocks.0.mlp.fc2")
+    state_dict = {key: tensor.detach().clone() for key, tensor in model.state_dict().items()}
+
+    convrot_quantizer = ConvRotInt8Quantizer(list(convrot_target_paths), [], allowed_groupsizes=(4,))
+    for module_path in convrot_target_paths:
+        weight = state_dict.pop(f"{module_path}.weight")
+        quantized_weight, scale = quantize_int8_convrot_weight(weight, 4)
+        state_dict[f"{module_path}.weight"] = quantized_weight
+        state_dict[f"{module_path}.scale_weight"] = scale
+    convrot_quantizer.module_groupsizes = {path: 4 for path in convrot_target_paths}
+
+    nvfp4_quantizer = NvFp4Quantizer()
+    from musubi_tuner.modules.nvfp4_utils import _quantize_nvfp4_2d
+
+    for module_path in nvfp4_target_paths:
+        weight = state_dict.pop(f"{module_path}.weight")
+        packed, block_scale, tensor_scale, _ = _quantize_nvfp4_2d(weight)
+        state_dict[f"{module_path}.weight"] = packed
+        state_dict[f"{module_path}.nvfp4_block_scale"] = block_scale
+        state_dict[f"{module_path}.nvfp4_scale"] = tensor_scale
+        nvfp4_quantizer.nvfp4_module_shapes[module_path] = tuple(weight.shape)
+
+    apply_nvfp4_convrot_mixed_monkey_patch(
+        model,
+        state_dict,
+        nvfp4_quantizer,
+        convrot_quantizer,
+        convrot_bwd_mode="bf16",
+        nvfp4_training=True,
+        nvfp4_calc_device=torch.device("cpu"),
+        nvfp4_columnwise_chunk_rows=1024,
+    )
+    model.load_state_dict(state_dict, strict=True, assign=True)
+    model.enable_gradient_checkpointing()
+    model.train()
+
+    network = lora_minimax_h3.create_arch_network(1.0, 2, 2.0, None, None, model)
+    network.apply_to(None, model, apply_text_encoder=False, apply_unet=True)
+    network.prepare_optimizer_params(unet_lr=1e-4)
+
+    # NVFP4 training forward (NvFp4LinearFn -> nvfp4_scaled_mm_linear) requires real FP4
+    # tensor-core execution; there is no CPU backward path (see nvfp4_utils.apply_nvfp4_monkey_patch's
+    # "training requires use_scaled_mm=True" guard), so this test only runs on CUDA (skipped above
+    # otherwise), mirroring the @requires_nvfp4_scaled_mm convention in test_nvfp4_training.py.
+    device = torch.device("cuda")
+    model = model.to(device)
+    network = network.to(device)
+
+    layout = build_h3_layout(
+        task="t2va",
+        text_length=3,
+        target_video=H3VideoGeometry(2, 4, 4),
+        target_audio_frames=8,
+    )
+
+    output = model(
+        video_latents=torch.randn(1, 24, 2, 4, 4, device=device),
+        audio_latents=torch.randn(1, 32, 2, 8, device=device),
+        text_hidden_states=torch.randn(1, 3, 12, device=device),
+        text_token_tags=torch.tensor([[1, 0, 1]], device=device),
+        layout=layout,
+        model_t_video=torch.tensor(0.25, device=device),
+        model_t_audio=torch.tensor(0.75, device=device),
+    )
+    (output.video.square().mean() + output.audio.square().mean()).backward()
+
+    qkv_lora = next(m for m in network.unet_loras if m.lora_name == "lora_unet_blocks_0_attn_qkv_proj")
+    fc1_lora = next(m for m in network.unet_loras if m.lora_name == "lora_unet_blocks_0_mlp_fc1")
+    assert any(torch.count_nonzero(p.grad) for p in qkv_lora.parameters() if p.grad is not None)
+    assert any(torch.count_nonzero(p.grad) for p in fc1_lora.parameters() if p.grad is not None)
+    for path in convrot_target_paths + nvfp4_target_paths:
+        assert model.get_submodule(path).weight.grad is None
 
 
 # --- guidance-distillation loss (contrastive guidance targets) ---
