@@ -856,6 +856,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 raise ValueError("--convrot_int8_bwd int8 requires a CUDA training device")
         if is_convrot_int8 and getattr(args, "base_weights", None):
             raise ValueError("MiniMax-H3 --base_weights cannot be merged into a ConvRot INT8 transformer base")
+        is_nvfp4 = bool(getattr(transformer, "is_nvfp4", False))
+        if is_nvfp4 and bool(getattr(args, "blocks_to_swap", 0)) and not getattr(args, "block_swap_h2d_only", False):
+            raise ValueError(
+                "MiniMax-H3 NVFP4-containing transformer bases require --block_swap_h2d_only when block swap is"
+                " enabled: the default block-swap offloader doesn't know about NVFP4's training-only columnwise"
+                " backward buffers."
+            )
 
     def process_sample_prompts(self, args, accelerator, sample_prompts):
         # only the default prepare_sampling needs this seam; guard against future

@@ -292,6 +292,23 @@ def test_h3_trainer_validates_backward_mode_and_destructive_merges_after_detecti
     trainer.on_transformer_loaded(_trainer_args(), None, int8)
 
 
+def test_h3_trainer_requires_block_swap_h2d_only_for_nvfp4_base_when_swapping():
+    trainer = MiniMaxH3NetworkTrainer()
+    mixed = SimpleNamespace(is_convrot_int8=True, is_nvfp4=True)
+
+    with pytest.raises(ValueError, match="block_swap_h2d_only"):
+        trainer.on_transformer_loaded(
+            _trainer_args(blocks_to_swap=8, block_swap_h2d_only=False), None, mixed
+        )
+    # no block swap requested: no constraint to violate
+    trainer.on_transformer_loaded(_trainer_args(blocks_to_swap=0, block_swap_h2d_only=False), None, mixed)
+    # block_swap_h2d_only satisfies the requirement
+    trainer.on_transformer_loaded(_trainer_args(blocks_to_swap=8, block_swap_h2d_only=True), None, mixed)
+    # a non-NVFP4 base has no such requirement
+    convrot_only = SimpleNamespace(is_convrot_int8=True, is_nvfp4=False)
+    trainer.on_transformer_loaded(_trainer_args(blocks_to_swap=8, block_swap_h2d_only=False), None, convrot_only)
+
+
 def test_h3_trainer_passes_backward_mode_to_loader_and_excludes_int8_linears_from_compile(monkeypatch):
     import musubi_tuner.minimax_h3_train_network as train
 
