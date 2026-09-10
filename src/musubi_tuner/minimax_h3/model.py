@@ -191,10 +191,9 @@ def parse_h3_transformer_config(
         blocked_markers -= {"nvfp4"}
     if any(marker in artifact_markers for marker in blocked_markers):
         raise ValueError(
-            "Unsupported quantized MiniMax-H3 checkpoint. ConvRot INT8 checkpoints are detected from their"
-            " tensor structure (or pass --convrot_int8 to quantize a BF16 checkpoint); NVFP4 is supported only"
-            " together with a co-resident ConvRot INT8 scope in the same checkpoint; other quantized formats"
-            " (fp8) are not supported."
+            "Unsupported quantized MiniMax-H3 checkpoint. ConvRot INT8 and NVFP4 checkpoints (pure or"
+            " co-resident) are detected from their tensor structure (or pass --convrot_int8 to quantize a BF16"
+            " checkpoint); other quantized formats (fp8) are not supported."
         )
     raw_config = metadata.get("config")
     if raw_config is None:
@@ -1195,9 +1194,11 @@ def _load_h3_transformer_mixed(
     prune_state: dict[str, torch.Tensor] | None = None,
     training: bool = True,
 ) -> MiniMaxH3Model:
-    """Load a transformer whose Linears mix ConvRot INT8 and NVFP4 (each module's format
-    declared in its own ``.comfy_quant`` spec), via
-    ``modules.mixed_quant_utils.load_nvfp4_convrot_mixed_state_dict``.
+    """Load a transformer whose Linears declare NVFP4 and/or ConvRot INT8 (each module's
+    format declared in its own ``.comfy_quant`` spec), via
+    ``modules.mixed_quant_utils.load_nvfp4_convrot_mixed_state_dict``. A pure-NVFP4
+    checkpoint (no ConvRot-declared modules) goes through this same path: the ConvRot
+    sub-quantizer just finds nothing to own.
 
     LoRA load-time merge is not supported here (the caller, ``load_h3_transformer``,
     rejects ``lora_weights`` before reaching this function): NVFP4 weights cannot be
@@ -1321,20 +1322,15 @@ def load_h3_transformer(
     if dtype != torch.bfloat16:
         raise ValueError("MiniMax-H3 accepts only BF16 transformer checkpoints")
     files = resolve_safetensors_files(checkpoint_path)
-    # Pre-quantized ConvRot INT8 artifacts (full or pruned), NVFP4+ConvRot INT8 mixed
-    # artifacts, and pruned BF16 artifacts are detected from their tensor structure;
-    # --convrot_int8 additionally quantizes BF16 checkpoints (full or pruned) on the fly.
-    # A pure NVFP4 transformer (no co-resident ConvRot INT8) is not supported: no such
-    # published file exists today, and silently mishandling it would be worse than a
-    # clear rejection.
+    # Pre-quantized ConvRot INT8 artifacts (full or pruned), NVFP4-only artifacts,
+    # NVFP4+ConvRot INT8 mixed artifacts, and pruned BF16 artifacts are all detected from
+    # their tensor structure; --convrot_int8 additionally quantizes BF16 checkpoints (full
+    # or pruned) on the fly. `_load_h3_transformer_mixed` handles a checkpoint with zero
+    # ConvRot-declared modules the same as any other split: the ConvRot sub-quantizer just
+    # finds nothing to own.
     formats = detect_comfy_quant_formats(files, disable_numpy_memmap=disable_mmap)
     detected_convrot = FORMAT_CONVROT_INT8 in formats
     detected_nvfp4 = FORMAT_NVFP4 in formats
-    if detected_nvfp4 and not detected_convrot:
-        raise ValueError(
-            "MiniMax-H3 does not support a pure NVFP4 transformer: NVFP4 is supported only together with a"
-            " co-resident ConvRot INT8 scope in the same checkpoint."
-        )
     prequantized = detected_convrot or detected_nvfp4
     use_convrot_int8 = convrot_int8 or detected_convrot
     use_nvfp4 = detected_nvfp4
