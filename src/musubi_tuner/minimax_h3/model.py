@@ -48,12 +48,13 @@ from musubi_tuner.minimax_h3.packing import (
     unpack_targets,
 )
 from musubi_tuner.modules.attention import AttentionParams, attention
+from musubi_tuner.modules.comfy_quant_utils import FORMAT_CONVROT_INT8, FORMAT_NVFP4, detect_comfy_quant_formats
 from musubi_tuner.modules.convrot_int8_utils import (
     block_has_convrot_patched_linear,
     canonicalize_convrot_int8_key,
-    has_comfy_quant_tensors,
 )
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, create_offloader
+from musubi_tuner.modules.mixed_quant_utils import apply_nvfp4_convrot_mixed_monkey_patch, load_nvfp4_convrot_mixed_state_dict
 from musubi_tuner.modules.nvfp4_utils import block_has_nvfp4_patched_linear, quantized_linear_swap_tensor_selector
 from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, WeightTransformHooks
@@ -179,14 +180,20 @@ _PUBLISHED_CONFIG_FIELDS = {
 }
 
 
-def parse_h3_transformer_config(metadata: Mapping[str, str], *, allow_convrot_int8: bool = False) -> MiniMaxH3Config:
+def parse_h3_transformer_config(
+    metadata: Mapping[str, str], *, allow_convrot_int8: bool = False, allow_nvfp4: bool = False
+) -> MiniMaxH3Config:
     artifact_markers = " ".join(f"{key}={value}" for key, value in metadata.items() if key != "config").lower()
-    blocked_markers = ("fp8", "nvfp4") if allow_convrot_int8 else ("convrot", "int8", "fp8", "nvfp4", "quantized")
+    blocked_markers = {"convrot", "int8", "fp8", "nvfp4", "quantized"}
+    if allow_convrot_int8:
+        blocked_markers -= {"convrot", "int8", "quantized"}
+    if allow_nvfp4:
+        blocked_markers -= {"nvfp4"}
     if any(marker in artifact_markers for marker in blocked_markers):
         raise ValueError(
-            "Unsupported quantized MiniMax-H3 checkpoint. ConvRot INT8 checkpoints are detected from their"
-            " tensor structure (or pass --convrot_int8 to quantize a BF16 checkpoint); other quantized"
-            " formats (fp8/NVFP4) are not supported."
+            "Unsupported quantized MiniMax-H3 checkpoint. ConvRot INT8 and NVFP4 checkpoints (pure or"
+            " co-resident) are detected from their tensor structure (or pass --convrot_int8 to quantize a BF16"
+            " checkpoint); other quantized formats (fp8) are not supported."
         )
     raw_config = metadata.get("config")
     if raw_config is None:
@@ -240,6 +247,7 @@ def classify_h3_transformer(
     files: Sequence[str | Path],
     *,
     allow_convrot_int8: bool = False,
+    allow_nvfp4: bool = False,
 ) -> MiniMaxH3Config:
     """Classify a transformer checkpoint as the published full or pruned-AdaLN structure.
 
@@ -251,7 +259,9 @@ def classify_h3_transformer(
     headers = _read_h3_tensor_headers(files)
     table = headers.get("adaln_t_table")
     if table is None:
-        return parse_h3_transformer_config(load_safetensors_metadata(files), allow_convrot_int8=allow_convrot_int8)
+        return parse_h3_transformer_config(
+            load_safetensors_metadata(files), allow_convrot_int8=allow_convrot_int8, allow_nvfp4=allow_nvfp4
+        )
     if any(key.startswith("time_embedder.") for key in headers):
         raise ValueError("MiniMax-H3 checkpoint has mixed adaln_t_table and time_embedder structures")
     table_dtype, table_shape = table
@@ -1170,6 +1180,67 @@ def _load_h3_transformer_convrot_int8(
     return model
 
 
+def _load_h3_transformer_mixed(
+    files: list[Path],
+    config: MiniMaxH3Config,
+    *,
+    device: torch.device,
+    quant_device: torch.device,
+    bwd_mode: str,
+    attn_mode: str,
+    split_attn: bool,
+    disable_mmap: bool,
+    prune_hooks: WeightTransformHooks | None = None,
+    prune_state: dict[str, torch.Tensor] | None = None,
+    training: bool = True,
+) -> MiniMaxH3Model:
+    """Load a transformer whose Linears declare NVFP4 and/or ConvRot INT8 (each module's
+    format declared in its own ``.comfy_quant`` spec), via
+    ``modules.mixed_quant_utils.load_nvfp4_convrot_mixed_state_dict``. A pure-NVFP4
+    checkpoint (no ConvRot-declared modules) goes through this same path: the ConvRot
+    sub-quantizer just finds nothing to own.
+
+    LoRA load-time merge is not supported here (the caller, ``load_h3_transformer``,
+    rejects ``lora_weights`` before reaching this function): NVFP4 weights cannot be
+    re-quantized after a merge, same restriction as Krea2 and Flux.2.
+    """
+    from accelerate import init_empty_weights
+
+    with init_empty_weights():
+        model = MiniMaxH3Model(config, attn_mode=attn_mode, split_attn=split_attn, dtype=torch.bfloat16)
+
+    sd, nvfp4_quantizer, convrot_quantizer = load_nvfp4_convrot_mixed_state_dict(
+        [str(path) for path in files],
+        convrot_target_keys=[],  # prequantized-only: no dynamic quantization in mixed mode
+        convrot_exclude_keys=H3_CONVROT_INT8_EXCLUDE_KEYS,
+        convrot_allowed_groupsizes=H3_CONVROT_INT8_ALLOWED_GROUPSIZES,
+        calc_device=quant_device,
+        move_to_device=(device == quant_device),
+        disable_numpy_memmap=disable_mmap,
+        weight_transform_hooks=prune_hooks,
+    )
+    if prune_state is not None:
+        sd.update(prune_state)
+    apply_nvfp4_convrot_mixed_monkey_patch(
+        model,
+        sd,
+        nvfp4_quantizer,
+        convrot_quantizer,
+        convrot_bwd_mode=bwd_mode,
+        nvfp4_training=training,
+        nvfp4_calc_device=quant_device,
+        nvfp4_columnwise_chunk_rows=1024,
+    )
+    for key in sd:
+        if sd[key].dtype == torch.float16:
+            sd[key] = sd[key].to(torch.bfloat16)
+        if device.type != "cpu":
+            sd[key] = sd[key].to(device)
+    model.load_state_dict(sd, strict=True, assign=True)
+    model.eval()
+    return model
+
+
 def _load_h3_transformer_bf16(
     files: Sequence[str | Path],
     config: MiniMaxH3Config,
@@ -1246,17 +1317,24 @@ def load_h3_transformer(
     lora_weights: list[dict] | None = None,
     lora_multipliers: list[float] | None = None,
     prune_adaln: bool = False,
+    training: bool = True,
 ) -> MiniMaxH3Model:
     if dtype != torch.bfloat16:
         raise ValueError("MiniMax-H3 accepts only BF16 transformer checkpoints")
     files = resolve_safetensors_files(checkpoint_path)
-    # Pre-quantized ConvRot INT8 artifacts (full or pruned) and pruned BF16 artifacts are
-    # detected from their tensor structure; --convrot_int8 additionally quantizes BF16
-    # checkpoints (full or pruned) on the fly — pruned AdaLN projections are 8-wide and
-    # fall outside every ConvRot group size, so the quantizer skips them automatically.
-    prequantized = has_comfy_quant_tensors(files, disable_numpy_memmap=disable_mmap)
-    use_convrot_int8 = convrot_int8 or prequantized
-    config = classify_h3_transformer(files, allow_convrot_int8=use_convrot_int8)
+    # Pre-quantized ConvRot INT8 artifacts (full or pruned), NVFP4-only artifacts,
+    # NVFP4+ConvRot INT8 mixed artifacts, and pruned BF16 artifacts are all detected from
+    # their tensor structure; --convrot_int8 additionally quantizes BF16 checkpoints (full
+    # or pruned) on the fly. `_load_h3_transformer_mixed` handles a checkpoint with zero
+    # ConvRot-declared modules the same as any other split: the ConvRot sub-quantizer just
+    # finds nothing to own.
+    formats = detect_comfy_quant_formats(files, disable_numpy_memmap=disable_mmap)
+    detected_convrot = FORMAT_CONVROT_INT8 in formats
+    detected_nvfp4 = FORMAT_NVFP4 in formats
+    prequantized = detected_convrot or detected_nvfp4
+    use_convrot_int8 = convrot_int8 or detected_convrot
+    use_nvfp4 = detected_nvfp4
+    config = classify_h3_transformer(files, allow_convrot_int8=use_convrot_int8, allow_nvfp4=use_nvfp4)
     prune_hooks: WeightTransformHooks | None = None
     prune_state: dict[str, torch.Tensor] | None = None
     if prune_adaln:
@@ -1264,8 +1342,9 @@ def load_h3_transformer(
             logger.info("MiniMax-H3 checkpoint is already pruned; --prune_adaln has no effect")
         elif prequantized:
             raise ValueError(
-                "--prune_adaln requires a BF16 MiniMax-H3 checkpoint; pre-quantized ConvRot INT8 checkpoints"
-                " cannot be pruned at load time (use the published pruned artifact instead)"
+                "--prune_adaln requires a BF16 MiniMax-H3 checkpoint; pre-quantized ConvRot INT8 or"
+                " NVFP4-containing checkpoints cannot be pruned at load time (use the published pruned"
+                " artifact instead)"
             )
         else:
             config = replace(config, adaln_rank=H3_PRUNE_ADALN_RANK)
@@ -1276,6 +1355,27 @@ def load_h3_transformer(
                 f"Pruning MiniMax-H3 AdaLN projections at load time (mean-centered rank-{H3_PRUNE_ADALN_RANK} basis,"
                 " time embedder retained)"
             )
+    if use_nvfp4:
+        if lora_weights:
+            raise ValueError(
+                "MiniMax-H3 load-time LoRA merge is not supported for an NVFP4-containing transformer base:"
+                " NVFP4 weights cannot be re-quantized after a merge. Train a LoRA network against the frozen"
+                " base instead, or merge against the original BF16 weights."
+            )
+        device = torch.device(device)
+        return _load_h3_transformer_mixed(
+            [Path(checkpoint_path)],  # unexpanded: the streaming loader expands split shards itself
+            config,
+            device=device,
+            quant_device=device if quant_device is None else torch.device(quant_device),
+            bwd_mode=convrot_int8_bwd,
+            attn_mode=attn_mode,
+            split_attn=split_attn,
+            disable_mmap=disable_mmap,
+            prune_hooks=prune_hooks,
+            prune_state=prune_state,
+            training=training,
+        )
     if use_convrot_int8:
         device = torch.device(device)
         return _load_h3_transformer_convrot_int8(

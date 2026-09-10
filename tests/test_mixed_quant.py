@@ -113,3 +113,67 @@ def test_composer_is_format_agnostic_with_a_single_sub_quantizer(tmp_path):
 
     assert "mlp_proj.nvfp4_block_scale" in state_dict
     assert "attn_proj.weight" not in state_dict  # no convrot sub-quantizer registered to claim it
+
+
+def test_load_nvfp4_convrot_mixed_state_dict_returns_sub_quantizers(tmp_path):
+    from musubi_tuner.modules.mixed_quant_utils import load_nvfp4_convrot_mixed_state_dict
+
+    path = _make_mixed_artifact(tmp_path)
+
+    state_dict, nvfp4_quantizer, convrot_quantizer = load_nvfp4_convrot_mixed_state_dict(
+        [path],
+        convrot_target_keys=["attn_proj"],
+        convrot_exclude_keys=[],
+        convrot_allowed_groupsizes=(256,),
+        calc_device=None,
+    )
+
+    assert state_dict["mlp_proj.weight"].dtype is torch.uint8
+    assert state_dict["attn_proj.weight"].dtype is torch.int8
+    assert nvfp4_quantizer.nvfp4_module_shapes == {"mlp_proj": (64, 32)}
+    assert convrot_quantizer.module_groupsizes == {"attn_proj": 256}
+
+
+def test_apply_nvfp4_convrot_mixed_monkey_patch_applies_both_patches_and_freezes(tmp_path):
+    import torch.nn as nn
+
+    from musubi_tuner.modules.mixed_quant_utils import (
+        apply_nvfp4_convrot_mixed_monkey_patch,
+        load_nvfp4_convrot_mixed_state_dict,
+    )
+
+    path = _make_mixed_artifact(tmp_path, include_passthrough_bias=False)
+    state_dict, nvfp4_quantizer, convrot_quantizer = load_nvfp4_convrot_mixed_state_dict(
+        [path],
+        convrot_target_keys=["attn_proj"],
+        convrot_exclude_keys=[],
+        convrot_allowed_groupsizes=(256,),
+        calc_device=None,
+    )
+
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp_proj = nn.Linear(32, 64, bias=False)
+            self.attn_proj = nn.Linear(256, 64, bias=False)
+
+    model = _Model()
+    apply_nvfp4_convrot_mixed_monkey_patch(
+        model,
+        state_dict,
+        nvfp4_quantizer,
+        convrot_quantizer,
+        convrot_bwd_mode="bf16",
+        nvfp4_training=True,
+        nvfp4_calc_device=torch.device("cpu"),
+        nvfp4_columnwise_chunk_rows=1024,
+    )
+
+    from musubi_tuner.modules.convrot_int8_utils import block_has_convrot_patched_linear
+    from musubi_tuner.modules.nvfp4_utils import block_has_nvfp4_patched_linear
+
+    assert block_has_nvfp4_patched_linear(model.mlp_proj)
+    assert block_has_convrot_patched_linear(model.attn_proj)
+    assert model.is_nvfp4 is True
+    assert model.is_convrot_int8 is True
+    assert all(not parameter.requires_grad for parameter in model.parameters())
