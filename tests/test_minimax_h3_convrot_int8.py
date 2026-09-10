@@ -22,13 +22,13 @@ from musubi_tuner.minimax_h3.model import (
     _load_h3_transformer_convrot_int8,
 )
 from musubi_tuner.minimax_h3.packing import H3VideoGeometry, build_h3_layout
+from musubi_tuner.modules.convrot_int8_kernels import quantize_int8_convrot_weight
 from musubi_tuner.modules.convrot_int8_utils import (
     ConvRotInt8Quantizer,
     parse_comfy_quant_spec,
     quantize_weight_convrot,
     select_convrot_groupsize,
 )
-from musubi_tuner.modules.convrot_int8_kernels import quantize_int8_convrot_weight
 
 
 def _convrot_config(num_layers: int = 1) -> MiniMaxH3Config:
@@ -351,6 +351,32 @@ def test_load_h3_transformer_detects_and_loads_mixed_nvfp4_convrot_checkpoint(tm
     assert model.is_nvfp4 is True
 
 
+def test_load_h3_transformer_mixed_leaves_undeclared_bf16_weights_unquantized(tmp_path, monkeypatch):
+    """Regression: the mixed loader must not dynamically ConvRot-quantize Linears the
+    checkpoint declares BF16. _save_mixed_prequantized_checkpoint only quantizes
+    attn.qkv_proj (ConvRot INT8) and mlp.fc1/fc2 (NVFP4); attn.out_proj and adaln_proj.linear
+    are left BF16, matching the published artifact where those layers stay unquantized."""
+    config = _convrot_config(num_layers=1)
+    path = tmp_path / "mixed.safetensors"
+    bf16_state = _save_tiny_bf16_checkpoint(tmp_path / "unused_bf16.safetensors", config)
+    _save_mixed_prequantized_checkpoint(path, bf16_state)
+
+    import musubi_tuner.minimax_h3.model as h3_model
+    from musubi_tuner.minimax_h3.model import load_h3_transformer
+
+    monkeypatch.setattr(h3_model, "parse_h3_transformer_config", lambda _metadata, **_kwargs: config)
+
+    model = load_h3_transformer(path, device="cpu")
+
+    out_proj = model.get_submodule("blocks.0.attn.out_proj")
+    assert out_proj.weight.dtype is torch.bfloat16
+    assert not hasattr(out_proj, "scale_weight")
+
+    adaln_linear = model.get_submodule("blocks.0.adaln_proj.linear")
+    assert adaln_linear.weight.dtype is torch.bfloat16
+    assert not hasattr(adaln_linear, "scale_weight")
+
+
 def test_load_h3_transformer_rejects_pure_nvfp4_without_convrot(tmp_path):
     config = _convrot_config(num_layers=1)
     bf16_state = _save_tiny_bf16_checkpoint(tmp_path / "unused_bf16.safetensors", config)
@@ -389,3 +415,58 @@ def test_load_h3_transformer_rejects_lora_weights_with_nvfp4(tmp_path, monkeypat
 
     with pytest.raises(ValueError, match="NVFP4"):
         load_h3_transformer(path, device="cpu", lora_weights=[{}], lora_multipliers=[1.0])
+
+
+class _StopAfterMixedPatchCall(Exception):
+    """Raised by the fake patch fn below to short-circuit load_h3_transformer before
+    load_state_dict, which would otherwise need a full, correctly-shaped state dict."""
+
+
+def test_load_h3_transformer_defaults_mixed_nvfp4_patch_to_training_true(tmp_path, monkeypatch):
+    config = _convrot_config(num_layers=1)
+    path = tmp_path / "mixed.safetensors"
+    bf16_state = _save_tiny_bf16_checkpoint(tmp_path / "unused_bf16.safetensors", config)
+    _save_mixed_prequantized_checkpoint(path, bf16_state)
+
+    import musubi_tuner.minimax_h3.model as h3_model
+    from musubi_tuner.minimax_h3.model import load_h3_transformer
+
+    monkeypatch.setattr(h3_model, "parse_h3_transformer_config", lambda _metadata, **_kwargs: config)
+
+    captured = {}
+
+    def fake_patch(model, sd, nvfp4_quantizer, convrot_quantizer, **kwargs):
+        captured["nvfp4_training"] = kwargs["nvfp4_training"]
+        raise _StopAfterMixedPatchCall()
+
+    monkeypatch.setattr(h3_model, "apply_nvfp4_convrot_mixed_monkey_patch", fake_patch)
+
+    with pytest.raises(_StopAfterMixedPatchCall):
+        load_h3_transformer(path, device="cpu")
+
+    assert captured["nvfp4_training"] is True
+
+
+def test_load_h3_transformer_threads_training_false_into_mixed_nvfp4_patch(tmp_path, monkeypatch):
+    config = _convrot_config(num_layers=1)
+    path = tmp_path / "mixed.safetensors"
+    bf16_state = _save_tiny_bf16_checkpoint(tmp_path / "unused_bf16.safetensors", config)
+    _save_mixed_prequantized_checkpoint(path, bf16_state)
+
+    import musubi_tuner.minimax_h3.model as h3_model
+    from musubi_tuner.minimax_h3.model import load_h3_transformer
+
+    monkeypatch.setattr(h3_model, "parse_h3_transformer_config", lambda _metadata, **_kwargs: config)
+
+    captured = {}
+
+    def fake_patch(model, sd, nvfp4_quantizer, convrot_quantizer, **kwargs):
+        captured["nvfp4_training"] = kwargs["nvfp4_training"]
+        raise _StopAfterMixedPatchCall()
+
+    monkeypatch.setattr(h3_model, "apply_nvfp4_convrot_mixed_monkey_patch", fake_patch)
+
+    with pytest.raises(_StopAfterMixedPatchCall):
+        load_h3_transformer(path, device="cpu", training=False)
+
+    assert captured["nvfp4_training"] is False

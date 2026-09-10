@@ -609,6 +609,7 @@ def _load_transformer(args: argparse.Namespace, device: torch.device) -> tuple[t
         lora_weights=lora_weights,
         lora_multipliers=lora_multipliers,
         prune_adaln=args.prune_adaln,
+        training=False,
     )
     attached_lora_networks = _configure_lora_weights(transformer, args, device, prequantized=prequantized)
     if args.blocks_to_swap:

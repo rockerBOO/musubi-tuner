@@ -4,7 +4,7 @@
 
 Musubi Tuner supports MiniMax-H3 text-to-video-with-audio (T2VA), first/last-frame-to-video-with-audio (FL2VA), and reference-to-video-with-audio (Ref2VA) LoRA training and standalone generation.
 
-The implementation follows the released MiniMax-H3 packing, Qwen3-VL conditioning, dual video/audio flow schedules, and two VAE layouts. It supports the published full and pruned BF16 transformers, the full and pruned ConvRot INT8 transformers, and the ConvRot INT8 and NVFP4+AWQ Qwen3-VL text encoders.
+The implementation follows the released MiniMax-H3 packing, Qwen3-VL conditioning, dual video/audio flow schedules, and two VAE layouts. It supports the published full and pruned BF16 transformers, the full and pruned ConvRot INT8 transformers, mixed NVFP4+ConvRot INT8 transformers, and the ConvRot INT8 and NVFP4+AWQ Qwen3-VL text encoders.
 
 Read and accept the [MiniMax-H3 Community License](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE) before downloading or using the weights.
 
@@ -28,7 +28,7 @@ Download the following files from [Comfy-Org/MiniMax-H3](https://huggingface.co/
 | Video VAE | `vae/minimax_h3_video_vae_fp16.safetensors` |
 | Audio VAE | `vae/minimax_h3_audio_vae_fp32.safetensors` |
 
-T2VA uses an FL2VA transformer without first/last conditions. Pre-quantized files (ConvRot INT8 full or pruned, transformer or text encoder; NVFP4+AWQ text encoder) and pruned BF16 transformers are detected automatically from their tensor structure — no extra flag is needed. FP8, NVFP4 transformers, and malformed or partial quantized files are rejected rather than silently interpreted as BF16. See [ConvRot INT8 Quantized Base Weights](#convrot-int8-quantized-base-weights) and [NVFP4 Text Encoder](#nvfp4-text-encoder) for details.
+T2VA uses an FL2VA transformer without first/last conditions. Pre-quantized files (ConvRot INT8 full or pruned, transformer or text encoder; mixed NVFP4+ConvRot INT8 transformer; NVFP4+AWQ text encoder) and pruned BF16 transformers are detected automatically from their tensor structure — no extra flag is needed. FP8, a pure NVFP4-only transformer (no co-resident ConvRot INT8), and malformed or partial quantized files are rejected rather than silently interpreted as BF16. See [ConvRot INT8 Quantized Base Weights](#convrot-int8-quantized-base-weights), [Mixed NVFP4+ConvRot INT8 Transformer](#mixed-nvfp4convrot-int8-transformer), and [NVFP4 Text Encoder](#nvfp4-text-encoder) for details.
 
 The Qwen3-VL processor and config are downloaded by Transformers from the official [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) repository (`processor` and `text_encoder` subfolders, a few config and tokenizer files only, no weights). The upstream `Qwen/Qwen3-VL-32B-Instruct` files are not interchangeable: the H3 tokenizer adds `<d>`, `</d>`, `<|cutoff|>`, `<|lyrics_start|>`, `<|lyrics_end|>`, `<|caption_start|>`, and `<|caption_end|>` as special tokens, and the released prompt format writes dialogue and lyrics as `<d>[Language] ...</d>`.
 
@@ -336,6 +336,14 @@ The published quantization scope is the five Linears in each of the 50 main DiT 
 **Training.** Flags match Krea 2: `--convrot_int8` for BF16 sources (pre-quantized files need no flag) plus optional `--convrot_int8_bwd {bf16,int8}` (default `bf16`; `int8` requires triton and CUDA). The LoRA trains in BF16 on top of the int8 base as usual, and block swap (including `--block_swap_h2d_only`) combines with quantization — quantization runs on the accelerator while the weights load to CPU, and the FP32 scale buffers stay resident on the execution device. Because block-swap training is transfer-bound, halving the weight bytes roughly halves the step time (measured: classic swap 48 27 -> 12.7 s/it, `--block_swap_h2d_only` + 32 8 -> ~4 s/it on the same GPU). `--fp8_base`/`--fp8_scaled` and `--base_weights` remain unsupported for an INT8 base. Triton (`triton-windows` on Windows) is required for the fused int8 kernels; without it the forward falls back to a slower transient dequantization (the memory saving remains). `torch.compile` excludes the patched Linears automatically.
 
 **Generation.** Pre-quantized checkpoints work as-is; add `--convrot_int8` only to quantize a BF16 checkpoint at load time. With `--lora_weight` the route depends on the base: a BF16 base with `--convrot_int8` merges the LoRA into the BF16 weights during the streaming load and quantizes the merged result (fastest inference); a pre-quantized base attaches each LoRA as a runtime additive branch with its own multiplier for the sampling lifetime — the INT8 base tensors are never modified or requantized, so LoRA generation no longer requires downloading the BF16 checkpoint.
+
+## Mixed NVFP4+ConvRot INT8 Transformer
+
+Some published artifacts mix NVFP4 and ConvRot INT8 within the same transformer checkpoint: each Linear's format is declared per-module by its own `comfy_quant` spec, rather than by a single scheme for the whole file. These mixed checkpoints are detected automatically from their tensor structure — pass the file as `--dit` and no extra flag is needed — and are supported for both LoRA training and generation. A pure NVFP4-only transformer (no co-resident ConvRot INT8 Linears) is not supported and is rejected at load time.
+
+**Requires `--block_swap_h2d_only` when using `--blocks_to_swap`.** As with Krea 2's `--nvfp4` (see the NVFP4 section in `docs/krea2.md`), NVFP4 training keeps an extra backward-only copy of each frozen NVFP4 weight that the default block-swap offloader can't handle correctly; `--blocks_to_swap N` on a mixed checkpoint without `--block_swap_h2d_only` is rejected at startup.
+
+**No load-time LoRA merge.** `--lora_weight` is not supported against an NVFP4-containing base: NVFP4 weights cannot be re-quantized after a merge. Train a LoRA network against the frozen base instead (the normal LoRA training flow), or merge against the original BF16 weights if one is available.
 
 ## NVFP4 Text Encoder
 
