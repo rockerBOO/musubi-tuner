@@ -318,3 +318,74 @@ def test_collect_grad_metrics_by_module_block_regex_excludes_nonmatching(trainer
     assert "grad_module/lora_unet_blocks_5_attn_wq" in metrics
     # lora_unet_first has no block id, so it must not contribute to any grad_block/* entry
     assert "grad_block/lora_unet_first" not in metrics
+
+
+def test_collect_grad_metrics_by_module_block_regex_zero_pads_for_sort_order(trainer):
+    """Numeric block ids are zero-padded so wandb's lexical key sort matches numeric order
+    (e.g. grad_block/02 < grad_block/03 < ... < grad_block/20, not "2" < "20" < "3")."""
+    named_params = _named_params_with_grads(
+        {
+            "lora_unet_blocks_2_attn_wq.lora_down.weight": [1.0, 0.0],
+            "lora_unet_blocks_3_attn_wq.lora_down.weight": [1.0, 0.0],
+            "lora_unet_blocks_20_attn_wq.lora_down.weight": [1.0, 0.0],
+        }
+    )
+    metrics = trainer.collect_grad_metrics_by_module(named_params, block_regex=re.compile(r"_blocks_(\d+)_"))
+    assert "grad_block/02" in metrics
+    assert "grad_block/03" in metrics
+    assert "grad_block/20" in metrics
+    assert "grad_block/2" not in metrics
+    assert "grad_block/3" not in metrics
+
+
+def test_collect_grad_metrics_by_module_block_regex_no_padding_when_single_digit_width(trainer):
+    """When every block id seen this call is the same digit-width, no padding is added
+    (keeps existing single-digit-only usage byte-identical)."""
+    named_params = _named_params_with_grads(
+        {
+            "lora_unet_blocks_2_attn_wq.lora_down.weight": [1.0, 0.0],
+            "lora_unet_blocks_5_attn_wq.lora_down.weight": [1.0, 0.0],
+        }
+    )
+    metrics = trainer.collect_grad_metrics_by_module(named_params, block_regex=re.compile(r"_blocks_(\d+)_"))
+    assert "grad_block/2" in metrics
+    assert "grad_block/5" in metrics
+
+
+def test_collect_grad_metrics_by_module_block_regex_non_numeric_ids_unpadded(trainer):
+    """Non-numeric captured block ids (e.g. a named-stage regex) are left untouched -- padding
+    is only applied when every captured id is a pure digit string."""
+    named_params = _named_params_with_grads(
+        {
+            "lora_unet_encoder_attn_wq.lora_down.weight": [1.0, 0.0],
+            "lora_unet_decoder_attn_wq.lora_down.weight": [1.0, 0.0],
+        }
+    )
+    metrics = trainer.collect_grad_metrics_by_module(
+        named_params, block_regex=re.compile(r"lora_unet_(encoder|decoder)_")
+    )
+    assert "grad_block/encoder" in metrics
+    assert "grad_block/decoder" in metrics
+
+
+def test_collect_grad_metrics_by_module_block_regex_width_grows_monotonically_across_calls(trainer):
+    """Once a wider block id has been seen on this trainer instance, later calls keep using
+    that width even if that particular step's ids happen to be narrower (e.g. a module-dropout
+    step), so the same block's key stays stable across steps within a run."""
+    regex = re.compile(r"_blocks_(\d+)_")
+    wide_params = _named_params_with_grads(
+        {
+            "lora_unet_blocks_2_attn_wq.lora_down.weight": [1.0, 0.0],
+            "lora_unet_blocks_20_attn_wq.lora_down.weight": [1.0, 0.0],
+        }
+    )
+    trainer.collect_grad_metrics_by_module(wide_params, block_regex=regex)
+
+    narrow_params = _named_params_with_grads(
+        {
+            "lora_unet_blocks_2_attn_wq.lora_down.weight": [1.0, 0.0],
+        }
+    )
+    metrics = trainer.collect_grad_metrics_by_module(narrow_params, block_regex=regex)
+    assert "grad_block/02" in metrics
+    assert "grad_block/2" not in metrics

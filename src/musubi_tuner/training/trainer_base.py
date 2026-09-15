@@ -265,9 +265,29 @@ class NetworkTrainer:
                 if m:
                     block_id = m.group(1)
                     block_sq_norms[block_id] = block_sq_norms.get(block_id, 0.0) + sq
-            logs.update({f"grad_block/{block_id}": sq**0.5 for block_id, sq in block_sq_norms.items()})
+            block_keys = self._zero_pad_block_ids(block_sq_norms.keys())
+            logs.update({f"grad_block/{block_keys[block_id]}": sq**0.5 for block_id, sq in block_sq_norms.items()})
 
         return logs
+
+    def _zero_pad_block_ids(self, block_ids) -> dict:
+        """Map raw captured block ids to zero-padded strings so wandb's lexical key sort
+        matches numeric order (e.g. "02" < "03" < ... < "20", not "2" < "20" < "3").
+
+        Only applies when every id is a pure digit string -- a user-supplied block_regex's
+        capture group may be non-numeric (e.g. named stages), which is left untouched.
+
+        The padding width is cached on the trainer instance and only grows, never shrinks,
+        across calls -- so a step where module_dropout drops the widest-numbered block
+        doesn't change that block's key on a later step within the same run.
+        """
+        block_ids = list(block_ids)
+        if not block_ids or not all(bid.isdigit() for bid in block_ids):
+            return {bid: bid for bid in block_ids}
+        width = max(len(bid) for bid in block_ids)
+        width = max(width, getattr(self, "_grad_block_id_width", 0))
+        self._grad_block_id_width = width
+        return {bid: bid.zfill(width) for bid in block_ids}
 
     def get_optimizer(self, args, trainable_params: list[torch.nn.Parameter]) -> tuple[str, str, torch.optim.Optimizer]:
         # adamw, adamw8bit, adafactor
