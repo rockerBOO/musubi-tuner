@@ -278,7 +278,7 @@ def _add_logging_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--log_grad_metrics_per_module",
         action="store_true",
-        help="also log per-module gradient norms (grad/module/<name>, pre-clip) to the tracker."
+        help="also log per-module gradient norms (grad_module/<name>, pre-clip) to the tracker."
         " Requires --log_grad_metrics. One entry per LoRA module (e.g. ~264 for krea2's default"
         " target set) -- more wandb traffic than --log_grad_metrics alone.",
     )
@@ -286,12 +286,12 @@ def _add_logging_args(parser: argparse.ArgumentParser) -> None:
         "--log_grad_metrics_block_regex",
         type=_grad_block_regex_type,
         default=None,
-        help="regex with exactly one capture group; when set, additionally logs grad/block/<id>"
+        help="regex with exactly one capture group; when set, additionally logs grad_block/<id>"
         " by matching it against each LoRA module name and aggregating matches by the captured"
         " id. Requires --log_grad_metrics. Architecture-specific -- e.g. krea2's block-indexed"
         " modules use '_blocks_(\\d+)_'. Independent of --log_grad_metrics_per_module (block"
         " aggregation doesn't require the per-module dump). Names that don't match are excluded"
-        " from grad/block/* but still appear under grad/module/* if that flag is also set.",
+        " from grad_block/* but still appear under grad_module/* if that flag is also set.",
     )
 
 

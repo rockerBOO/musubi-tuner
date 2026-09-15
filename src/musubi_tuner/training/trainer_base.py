@@ -222,11 +222,11 @@ class NetworkTrainer:
 
         named_parameters: iterable of (name, param) pairs, e.g. network.named_parameters().
         block_regex: optional compiled regex with exactly one capture group; when given,
-        additionally aggregates module norms into grad/block/<id> by the captured group.
-        Modules whose name doesn't match are excluded from grad/block/* but still appear
-        under grad/module/* (if per_module is True).
-        per_module: whether to include the grad/module/<name> entries in the result.
-        When False (block_regex-only usage), only grad/block/* entries are produced,
+        additionally aggregates module norms into grad_block/<id> by the captured group.
+        Modules whose name doesn't match are excluded from grad_block/* but still appear
+        under grad_module/* (if per_module is True).
+        per_module: whether to include the grad_module/<name> entries in the result.
+        When False (block_regex-only usage), only grad_block/* entries are produced,
         avoiding the cost of building ~one entry per LoRA module.
 
         Computes all per-parameter norms as tensors first and only converts to Python
@@ -256,7 +256,7 @@ class NetworkTrainer:
 
         logs: dict[str, float] = {}
         if per_module:
-            logs.update({f"grad/module/{name}": sq**0.5 for name, sq in module_sq_norms.items()})
+            logs.update({f"grad_module/{name}": sq**0.5 for name, sq in module_sq_norms.items()})
 
         if block_regex is not None:
             block_sq_norms: dict[str, float] = {}
@@ -265,7 +265,7 @@ class NetworkTrainer:
                 if m:
                     block_id = m.group(1)
                     block_sq_norms[block_id] = block_sq_norms.get(block_id, 0.0) + sq
-            logs.update({f"grad/block/{block_id}": sq**0.5 for block_id, sq in block_sq_norms.items()})
+            logs.update({f"grad_block/{block_id}": sq**0.5 for block_id, sq in block_sq_norms.items()})
 
         return logs
 

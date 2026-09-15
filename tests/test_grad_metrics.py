@@ -214,7 +214,7 @@ def _named_params_with_grads(named_values: dict[str, list[float]]) -> list[tuple
 
 
 def test_collect_grad_metrics_by_module_two_modules(trainer):
-    """Each module gets its own grad/module/<name> entry, not a global total."""
+    """Each module gets its own grad_module/<name> entry, not a global total."""
     named_params = _named_params_with_grads(
         {
             "lora_unet_first.lora_down.weight": [3.0, 4.0],  # norm = 5
@@ -222,9 +222,9 @@ def test_collect_grad_metrics_by_module_two_modules(trainer):
         }
     )
     metrics = trainer.collect_grad_metrics_by_module(named_params)
-    assert metrics["grad/module/lora_unet_first"] == pytest.approx(5.0)
-    assert metrics["grad/module/lora_unet_last_linear"] == pytest.approx(1.0)
-    assert "grad/module/lora_unet_first.lora_down.weight" not in metrics
+    assert metrics["grad_module/lora_unet_first"] == pytest.approx(5.0)
+    assert metrics["grad_module/lora_unet_last_linear"] == pytest.approx(1.0)
+    assert "grad_module/lora_unet_first.lora_down.weight" not in metrics
 
 
 def test_collect_grad_metrics_by_module_combines_multiple_params_per_module(trainer):
@@ -237,7 +237,7 @@ def test_collect_grad_metrics_by_module_combines_multiple_params_per_module(trai
     )
     metrics = trainer.collect_grad_metrics_by_module(named_params)
     # combined: sqrt(3^2 + 4^2) = 5, not 3 + 4 = 7
-    assert metrics["grad/module/lora_unet_tmlp_0"] == pytest.approx(5.0)
+    assert metrics["grad_module/lora_unet_tmlp_0"] == pytest.approx(5.0)
 
 
 def test_collect_grad_metrics_by_module_empty_when_no_grads(trainer):
@@ -248,7 +248,7 @@ def test_collect_grad_metrics_by_module_empty_when_no_grads(trainer):
 
 
 def test_collect_grad_metrics_by_module_block_regex_groups_matching_modules(trainer):
-    """block_regex aggregates modules whose name matches into grad/block/<id>."""
+    """block_regex aggregates modules whose name matches into grad_block/<id>."""
     import re
 
     named_params = _named_params_with_grads(
@@ -259,12 +259,12 @@ def test_collect_grad_metrics_by_module_block_regex_groups_matching_modules(trai
     )
     metrics = trainer.collect_grad_metrics_by_module(named_params, block_regex=re.compile(r"_blocks_(\d+)_"))
     # sqrt(3^2 + 4^2) = 5
-    assert metrics["grad/block/5"] == pytest.approx(5.0)
+    assert metrics["grad_block/5"] == pytest.approx(5.0)
 
 
 def test_collect_grad_metrics_by_module_block_regex_only_omits_module_entries(trainer):
-    """When only block_regex is requested (per_module=False), no grad/module/* entries
-    are produced -- only grad/block/*. This keeps --log_grad_metrics_block_regex cheap
+    """When only block_regex is requested (per_module=False), no grad_module/* entries
+    are produced -- only grad_block/*. This keeps --log_grad_metrics_block_regex cheap
     when used without --log_grad_metrics_per_module."""
     import re
 
@@ -277,13 +277,13 @@ def test_collect_grad_metrics_by_module_block_regex_only_omits_module_entries(tr
     metrics = trainer.collect_grad_metrics_by_module(
         named_params, block_regex=re.compile(r"_blocks_(\d+)_"), per_module=False
     )
-    assert metrics["grad/block/5"] == pytest.approx(5.0)
-    assert not any(k.startswith("grad/module/") for k in metrics)
+    assert metrics["grad_block/5"] == pytest.approx(5.0)
+    assert not any(k.startswith("grad_module/") for k in metrics)
 
 
 def test_collect_grad_metrics_by_module_per_module_and_block_both_set(trainer):
-    """When both per_module=True and block_regex are set, both grad/module/* and
-    grad/block/* entries appear."""
+    """When both per_module=True and block_regex are set, both grad_module/* and
+    grad_block/* entries appear."""
     import re
 
     named_params = _named_params_with_grads(
@@ -295,13 +295,13 @@ def test_collect_grad_metrics_by_module_per_module_and_block_both_set(trainer):
     metrics = trainer.collect_grad_metrics_by_module(
         named_params, block_regex=re.compile(r"_blocks_(\d+)_"), per_module=True
     )
-    assert metrics["grad/block/5"] == pytest.approx(5.0)
-    assert "grad/module/lora_unet_blocks_5_attn_wq" in metrics
-    assert "grad/module/lora_unet_blocks_5_attn_wk" in metrics
+    assert metrics["grad_block/5"] == pytest.approx(5.0)
+    assert "grad_module/lora_unet_blocks_5_attn_wq" in metrics
+    assert "grad_module/lora_unet_blocks_5_attn_wk" in metrics
 
 
 def test_collect_grad_metrics_by_module_block_regex_excludes_nonmatching(trainer):
-    """Modules that don't match block_regex are absent from grad/block/* but present under grad/module/*."""
+    """Modules that don't match block_regex are absent from grad_block/* but present under grad_module/*."""
     import re
 
     named_params = _named_params_with_grads(
@@ -311,10 +311,10 @@ def test_collect_grad_metrics_by_module_block_regex_excludes_nonmatching(trainer
         }
     )
     metrics = trainer.collect_grad_metrics_by_module(named_params, block_regex=re.compile(r"_blocks_(\d+)_"))
-    assert "grad/block/5" in metrics
-    assert not any(k.startswith("grad/block/") and k != "grad/block/5" for k in metrics)
-    assert metrics["grad/module/lora_unet_first"] == pytest.approx(1.0)
-    assert "grad/module/lora_unet_first" in metrics
-    assert "grad/module/lora_unet_blocks_5_attn_wq" in metrics
-    # lora_unet_first has no block id, so it must not contribute to any grad/block/* entry
-    assert "grad/block/lora_unet_first" not in metrics
+    assert "grad_block/5" in metrics
+    assert not any(k.startswith("grad_block/") and k != "grad_block/5" for k in metrics)
+    assert metrics["grad_module/lora_unet_first"] == pytest.approx(1.0)
+    assert "grad_module/lora_unet_first" in metrics
+    assert "grad_module/lora_unet_blocks_5_attn_wq" in metrics
+    # lora_unet_first has no block id, so it must not contribute to any grad_block/* entry
+    assert "grad_block/lora_unet_first" not in metrics
