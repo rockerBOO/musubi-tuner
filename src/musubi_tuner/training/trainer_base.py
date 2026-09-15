@@ -210,7 +210,9 @@ class NetworkTrainer:
             "grad/max": max_grad.item(),
         }
 
-    def collect_grad_metrics_by_module(self, named_parameters, block_regex: Optional[re.Pattern] = None) -> dict:
+    def collect_grad_metrics_by_module(
+        self, named_parameters, block_regex: Optional[re.Pattern] = None, per_module: bool = True
+    ) -> dict:
         """Per-module (and optional per-block) gradient L2 norms, pre-clip.
 
         Groups by the top-level module name (the part of each parameter's dotted
@@ -222,7 +224,13 @@ class NetworkTrainer:
         block_regex: optional compiled regex with exactly one capture group; when given,
         additionally aggregates module norms into grad/block/<id> by the captured group.
         Modules whose name doesn't match are excluded from grad/block/* but still appear
-        under grad/module/*.
+        under grad/module/* (if per_module is True).
+        per_module: whether to include the grad/module/<name> entries in the result.
+        When False (block_regex-only usage), only grad/block/* entries are produced,
+        avoiding the cost of building ~one entry per LoRA module.
+
+        Computes all per-parameter norms as tensors first and only converts to Python
+        floats once at the end, to avoid one GPU sync per parameter.
 
         Returns empty dict if no parameters have gradients.
         """
@@ -230,13 +238,25 @@ class NetworkTrainer:
         if not items:
             return {}
 
-        module_sq_norms: dict[str, float] = {}
-        for name, grad in items:
-            module_name = name.split(".", 1)[0]
-            sq = grad.norm().item() ** 2
-            module_sq_norms[module_name] = module_sq_norms.get(module_name, 0.0) + sq
+        names = [name for name, _ in items]
+        norms = torch.stack([grad.norm() for _, grad in items])  # one tensor, no .item() yet
 
-        logs = {f"grad/module/{name}": sq**0.5 for name, sq in module_sq_norms.items()}
+        module_names = [name.split(".", 1)[0] for name in names]
+        unique_modules = sorted(set(module_names))
+        module_index = {name: i for i, name in enumerate(unique_modules)}
+
+        # sum of squares per module via scatter-add, still on-device
+        sq_norms = norms**2
+        module_sq = torch.zeros(len(unique_modules), dtype=sq_norms.dtype, device=sq_norms.device)
+        idx_tensor = torch.tensor([module_index[m] for m in module_names], device=sq_norms.device)
+        module_sq.scatter_add_(0, idx_tensor, sq_norms)
+
+        module_sq_list = module_sq.tolist()  # single sync
+        module_sq_norms: dict[str, float] = dict(zip(unique_modules, module_sq_list))
+
+        logs: dict[str, float] = {}
+        if per_module:
+            logs.update({f"grad/module/{name}": sq**0.5 for name, sq in module_sq_norms.items()})
 
         if block_regex is not None:
             block_sq_norms: dict[str, float] = {}
@@ -2268,7 +2288,9 @@ class NetworkTrainer:
                             if args.log_grad_metrics_per_module or args.log_grad_metrics_block_regex is not None:
                                 grad_metrics.update(
                                     self.collect_grad_metrics_by_module(
-                                        network.named_parameters(), args.log_grad_metrics_block_regex
+                                        accelerator.unwrap_model(network).named_parameters(),
+                                        args.log_grad_metrics_block_regex,
+                                        per_module=args.log_grad_metrics_per_module,
                                     )
                                 )
 

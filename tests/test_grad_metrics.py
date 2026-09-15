@@ -182,6 +182,26 @@ def test_read_config_from_file_rejects_invalid_block_regex(tmp_path, monkeypatch
         read_config_from_file(args, parser)
 
 
+def test_collect_grad_metrics_by_module_call_site_unwraps_model():
+    """The train-loop call site must call collect_grad_metrics_by_module with
+    accelerator.unwrap_model(network).named_parameters(), not network.named_parameters()
+    directly -- under DDP, network is the accelerate.prepare()-wrapped model, and every
+    parameter name would get a 'module.' prefix, collapsing all per-module/per-block
+    grouping into a single useless bucket."""
+    import inspect
+
+    from musubi_tuner.training.trainer_base import NetworkTrainer
+
+    source = inspect.getsource(NetworkTrainer._run_training_loop)
+    call_idx = source.index("self.collect_grad_metrics_by_module(")
+    # look at the call arguments (a small window after the call) for the unwrap
+    call_args = source[call_idx : call_idx + 200]
+    assert "accelerator.unwrap_model(network).named_parameters()" in call_args, (
+        "collect_grad_metrics_by_module call site must unwrap the accelerate-prepared "
+        f"model before calling named_parameters(); got: {call_args!r}"
+    )
+
+
 def _named_params_with_grads(named_values: dict[str, list[float]]) -> list[tuple[str, nn.Parameter]]:
     """Create (name, param) pairs with fixed gradient values, matching what
     network.named_parameters() yields."""
@@ -240,6 +260,44 @@ def test_collect_grad_metrics_by_module_block_regex_groups_matching_modules(trai
     metrics = trainer.collect_grad_metrics_by_module(named_params, block_regex=re.compile(r"_blocks_(\d+)_"))
     # sqrt(3^2 + 4^2) = 5
     assert metrics["grad/block/5"] == pytest.approx(5.0)
+
+
+def test_collect_grad_metrics_by_module_block_regex_only_omits_module_entries(trainer):
+    """When only block_regex is requested (per_module=False), no grad/module/* entries
+    are produced -- only grad/block/*. This keeps --log_grad_metrics_block_regex cheap
+    when used without --log_grad_metrics_per_module."""
+    import re
+
+    named_params = _named_params_with_grads(
+        {
+            "lora_unet_blocks_5_attn_wq.lora_down.weight": [3.0, 0.0],
+            "lora_unet_blocks_5_attn_wk.lora_down.weight": [0.0, 4.0],
+        }
+    )
+    metrics = trainer.collect_grad_metrics_by_module(
+        named_params, block_regex=re.compile(r"_blocks_(\d+)_"), per_module=False
+    )
+    assert metrics["grad/block/5"] == pytest.approx(5.0)
+    assert not any(k.startswith("grad/module/") for k in metrics)
+
+
+def test_collect_grad_metrics_by_module_per_module_and_block_both_set(trainer):
+    """When both per_module=True and block_regex are set, both grad/module/* and
+    grad/block/* entries appear."""
+    import re
+
+    named_params = _named_params_with_grads(
+        {
+            "lora_unet_blocks_5_attn_wq.lora_down.weight": [3.0, 0.0],
+            "lora_unet_blocks_5_attn_wk.lora_down.weight": [0.0, 4.0],
+        }
+    )
+    metrics = trainer.collect_grad_metrics_by_module(
+        named_params, block_regex=re.compile(r"_blocks_(\d+)_"), per_module=True
+    )
+    assert metrics["grad/block/5"] == pytest.approx(5.0)
+    assert "grad/module/lora_unet_blocks_5_attn_wq" in metrics
+    assert "grad/module/lora_unet_blocks_5_attn_wk" in metrics
 
 
 def test_collect_grad_metrics_by_module_block_regex_excludes_nonmatching(trainer):
