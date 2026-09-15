@@ -143,3 +143,83 @@ def test_log_grad_metrics_block_regex_rejects_multiple_groups():
     parser = setup_parser_common()
     with pytest.raises(SystemExit):
         parser.parse_known_args(["--log_grad_metrics_block_regex", r"(blocks)_(\d+)"])
+
+
+def _named_params_with_grads(named_values: dict[str, list[float]]) -> list[tuple[str, nn.Parameter]]:
+    """Create (name, param) pairs with fixed gradient values, matching what
+    network.named_parameters() yields."""
+    named_params = []
+    for name, vals in named_values.items():
+        p = nn.Parameter(torch.zeros(len(vals)))
+        p.grad = torch.tensor(vals)
+        named_params.append((name, p))
+    return named_params
+
+
+def test_collect_grad_metrics_by_module_two_modules(trainer):
+    """Each module gets its own grad/module/<name> entry, not a global total."""
+    named_params = _named_params_with_grads(
+        {
+            "lora_unet_first.lora_down.weight": [3.0, 4.0],  # norm = 5
+            "lora_unet_last_linear.lora_down.weight": [1.0, 0.0],  # norm = 1
+        }
+    )
+    metrics = trainer.collect_grad_metrics_by_module(named_params)
+    assert metrics["grad/module/lora_unet_first"] == pytest.approx(5.0)
+    assert metrics["grad/module/lora_unet_last_linear"] == pytest.approx(1.0)
+    assert "grad/module/lora_unet_first.lora_down.weight" not in metrics
+
+
+def test_collect_grad_metrics_by_module_combines_multiple_params_per_module(trainer):
+    """A module with lora_down + lora_up combines via sqrt-sum-of-squares, not linear sum."""
+    named_params = _named_params_with_grads(
+        {
+            "lora_unet_tmlp_0.lora_down.weight": [3.0, 0.0],  # norm = 3
+            "lora_unet_tmlp_0.lora_up.weight": [0.0, 4.0],  # norm = 4
+        }
+    )
+    metrics = trainer.collect_grad_metrics_by_module(named_params)
+    # combined: sqrt(3^2 + 4^2) = 5, not 3 + 4 = 7
+    assert metrics["grad/module/lora_unet_tmlp_0"] == pytest.approx(5.0)
+
+
+def test_collect_grad_metrics_by_module_empty_when_no_grads(trainer):
+    """Returns empty dict when no parameters have gradients."""
+    p = nn.Parameter(torch.zeros(4))  # grad is None
+    metrics = trainer.collect_grad_metrics_by_module([("lora_unet_first.lora_down.weight", p)])
+    assert metrics == {}
+
+
+def test_collect_grad_metrics_by_module_block_regex_groups_matching_modules(trainer):
+    """block_regex aggregates modules whose name matches into grad/block/<id>."""
+    import re
+
+    named_params = _named_params_with_grads(
+        {
+            "lora_unet_blocks_5_attn_wq.lora_down.weight": [3.0, 0.0],  # norm = 3
+            "lora_unet_blocks_5_attn_wk.lora_down.weight": [0.0, 4.0],  # norm = 4
+        }
+    )
+    metrics = trainer.collect_grad_metrics_by_module(named_params, block_regex=re.compile(r"_blocks_(\d+)_"))
+    # sqrt(3^2 + 4^2) = 5
+    assert metrics["grad/block/5"] == pytest.approx(5.0)
+
+
+def test_collect_grad_metrics_by_module_block_regex_excludes_nonmatching(trainer):
+    """Modules that don't match block_regex are absent from grad/block/* but present under grad/module/*."""
+    import re
+
+    named_params = _named_params_with_grads(
+        {
+            "lora_unet_blocks_5_attn_wq.lora_down.weight": [3.0, 4.0],
+            "lora_unet_first.lora_down.weight": [1.0, 0.0],
+        }
+    )
+    metrics = trainer.collect_grad_metrics_by_module(named_params, block_regex=re.compile(r"_blocks_(\d+)_"))
+    assert "grad/block/5" in metrics
+    assert not any(k.startswith("grad/block/") and k != "grad/block/5" for k in metrics)
+    assert metrics["grad/module/lora_unet_first"] == pytest.approx(1.0)
+    assert "grad/module/lora_unet_first" in metrics
+    assert "grad/module/lora_unet_blocks_5_attn_wq" in metrics
+    # lora_unet_first has no block id, so it must not contribute to any grad/block/* entry
+    assert "grad/block/lora_unet_first" not in metrics

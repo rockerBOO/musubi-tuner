@@ -9,6 +9,7 @@ wan_train_network.py, ...).
 
 import ast
 import asyncio
+import re
 import importlib
 import argparse
 import math
@@ -208,6 +209,45 @@ class NetworkTrainer:
             "grad/mean_norm": mean_norm.item(),
             "grad/max": max_grad.item(),
         }
+
+    def collect_grad_metrics_by_module(self, named_parameters, block_regex: Optional[re.Pattern] = None) -> dict:
+        """Per-module (and optional per-block) gradient L2 norms, pre-clip.
+
+        Groups by the top-level module name (the part of each parameter's dotted
+        name before the first '.'), which is architecture-agnostic for any
+        LoRANetwork since module registration always uses this convention
+        (networks/lora.py: self.add_module(lora.lora_name, lora)).
+
+        named_parameters: iterable of (name, param) pairs, e.g. network.named_parameters().
+        block_regex: optional compiled regex with exactly one capture group; when given,
+        additionally aggregates module norms into grad/block/<id> by the captured group.
+        Modules whose name doesn't match are excluded from grad/block/* but still appear
+        under grad/module/*.
+
+        Returns empty dict if no parameters have gradients.
+        """
+        items = [(name, p.grad.detach()) for name, p in named_parameters if p.grad is not None]
+        if not items:
+            return {}
+
+        module_sq_norms: dict[str, float] = {}
+        for name, grad in items:
+            module_name = name.split(".", 1)[0]
+            sq = grad.norm().item() ** 2
+            module_sq_norms[module_name] = module_sq_norms.get(module_name, 0.0) + sq
+
+        logs = {f"grad/module/{name}": sq**0.5 for name, sq in module_sq_norms.items()}
+
+        if block_regex is not None:
+            block_sq_norms: dict[str, float] = {}
+            for module_name, sq in module_sq_norms.items():
+                m = block_regex.search(module_name)
+                if m:
+                    block_id = m.group(1)
+                    block_sq_norms[block_id] = block_sq_norms.get(block_id, 0.0) + sq
+            logs.update({f"grad/block/{block_id}": sq**0.5 for block_id, sq in block_sq_norms.items()})
+
+        return logs
 
     def get_optimizer(self, args, trainable_params: list[torch.nn.Parameter]) -> tuple[str, str, torch.optim.Optimizer]:
         # adamw, adamw8bit, adafactor
