@@ -2265,6 +2265,12 @@ class NetworkTrainer:
 
                         if args.log_grad_metrics and len(accelerator.trackers) > 0:
                             grad_metrics = self.collect_grad_metrics(network.parameters())
+                            if args.log_grad_metrics_per_module or args.log_grad_metrics_block_regex is not None:
+                                grad_metrics.update(
+                                    self.collect_grad_metrics_by_module(
+                                        network.named_parameters(), args.log_grad_metrics_block_regex
+                                    )
+                                )
 
                         if args.max_grad_norm != 0.0:
                             params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
