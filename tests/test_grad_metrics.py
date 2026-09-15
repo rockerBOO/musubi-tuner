@@ -93,3 +93,53 @@ def test_log_grad_metrics_flag_default_off():
     assert args.log_grad_metrics is False
     args, _ = parser.parse_known_args(["--log_grad_metrics"])
     assert args.log_grad_metrics is True
+
+
+def test_log_grad_metrics_per_module_flag_default_off():
+    """--log_grad_metrics_per_module exists in the common parser and defaults to False."""
+    from musubi_tuner.training.parser_common import setup_parser_common
+
+    parser = setup_parser_common()
+    args, _ = parser.parse_known_args([])
+    assert args.log_grad_metrics_per_module is False
+    args, _ = parser.parse_known_args(["--log_grad_metrics_per_module"])
+    assert args.log_grad_metrics_per_module is True
+
+
+def test_log_grad_metrics_block_regex_default_none():
+    """--log_grad_metrics_block_regex defaults to None."""
+    from musubi_tuner.training.parser_common import setup_parser_common
+
+    parser = setup_parser_common()
+    args, _ = parser.parse_known_args([])
+    assert args.log_grad_metrics_block_regex is None
+
+
+def test_log_grad_metrics_block_regex_compiles_valid_pattern():
+    """A regex with exactly one capture group is compiled and stored as a re.Pattern."""
+    import re
+
+    from musubi_tuner.training.parser_common import setup_parser_common
+
+    parser = setup_parser_common()
+    args, _ = parser.parse_known_args(["--log_grad_metrics_block_regex", r"_blocks_(\d+)_"])
+    assert isinstance(args.log_grad_metrics_block_regex, re.Pattern)
+    assert args.log_grad_metrics_block_regex.groups == 1
+
+
+def test_log_grad_metrics_block_regex_rejects_zero_groups():
+    """A regex with no capture group fails at parse time, not mid-run."""
+    from musubi_tuner.training.parser_common import setup_parser_common
+
+    parser = setup_parser_common()
+    with pytest.raises(SystemExit):
+        parser.parse_known_args(["--log_grad_metrics_block_regex", r"_blocks_\d+_"])
+
+
+def test_log_grad_metrics_block_regex_rejects_multiple_groups():
+    """A regex with more than one capture group fails at parse time."""
+    from musubi_tuner.training.parser_common import setup_parser_common
+
+    parser = setup_parser_common()
+    with pytest.raises(SystemExit):
+        parser.parse_known_args(["--log_grad_metrics_block_regex", r"(blocks)_(\d+)"])

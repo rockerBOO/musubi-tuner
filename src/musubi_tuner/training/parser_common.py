@@ -9,6 +9,7 @@ import argparse
 import logging
 import os
 import pathlib
+import re
 
 import toml
 from accelerate.utils import DynamoBackend
@@ -211,6 +212,20 @@ def _add_training_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _grad_block_regex_type(value: str) -> re.Pattern:
+    """argparse `type=` for --log_grad_metrics_block_regex: compiles and validates the
+    pattern has exactly one capture group, at parse time rather than at first use."""
+    try:
+        pattern = re.compile(value)
+    except re.error as e:
+        raise argparse.ArgumentTypeError(f"invalid regex for --log_grad_metrics_block_regex: {e}")
+    if pattern.groups != 1:
+        raise argparse.ArgumentTypeError(
+            f"--log_grad_metrics_block_regex must have exactly one capture group, got {pattern.groups}: {value!r}"
+        )
+    return pattern
+
+
 def _add_logging_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--logging_dir",
@@ -259,6 +274,24 @@ def _add_logging_args(parser: argparse.ArgumentParser) -> None:
         help="log gradient norm metrics (grad/norm, grad/mean_norm, grad/max, pre-clipping) to the tracker."
         " Adds a small per-step GPU sync overhead"
         " / 勾配ノルムのメトリクス（grad/norm, grad/mean_norm, grad/max、クリッピング前）をトラッカーに出力する。ステップごとにわずかなGPU同期のオーバーヘッドが発生する",
+    )
+    parser.add_argument(
+        "--log_grad_metrics_per_module",
+        action="store_true",
+        help="also log per-module gradient norms (grad/module/<name>, pre-clip) to the tracker."
+        " Requires --log_grad_metrics. One entry per LoRA module (e.g. ~264 for krea2's default"
+        " target set) -- more wandb traffic than --log_grad_metrics alone.",
+    )
+    parser.add_argument(
+        "--log_grad_metrics_block_regex",
+        type=_grad_block_regex_type,
+        default=None,
+        help="regex with exactly one capture group; when set, additionally logs grad/block/<id>"
+        " by matching it against each LoRA module name and aggregating matches by the captured"
+        " id. Requires --log_grad_metrics. Architecture-specific -- e.g. krea2's block-indexed"
+        " modules use '_blocks_(\\d+)_'. Independent of --log_grad_metrics_per_module (block"
+        " aggregation doesn't require the per-module dump). Names that don't match are excluded"
+        " from grad/block/* but still appear under grad/module/* if that flag is also set.",
     )
 
 
