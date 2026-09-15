@@ -869,4 +869,14 @@ def read_config_from_file(args: argparse.Namespace, parser: argparse.ArgumentPar
     args.config_file = os.path.splitext(args.config_file)[0]
     logger.info(args.config_file)
 
+    # argparse only applies `type=` conversion to values that were actually present on
+    # the command line -- attributes pre-set on the namespace (i.e. everything coming
+    # from the TOML file) pass through untouched. Normalize any TOML-sourced value that
+    # still needs the `_grad_block_regex_type` validator/compiler applied.
+    if isinstance(args.log_grad_metrics_block_regex, str):
+        try:
+            args.log_grad_metrics_block_regex = _grad_block_regex_type(args.log_grad_metrics_block_regex)
+        except argparse.ArgumentTypeError as e:
+            parser.error(str(e))
+
     return args

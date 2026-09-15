@@ -1,5 +1,7 @@
 """Tests for gradient metrics collection (grad/norm, grad/mean_norm, grad/max)."""
 
+import re
+
 import torch
 import torch.nn as nn
 import pytest
@@ -143,6 +145,41 @@ def test_log_grad_metrics_block_regex_rejects_multiple_groups():
     parser = setup_parser_common()
     with pytest.raises(SystemExit):
         parser.parse_known_args(["--log_grad_metrics_block_regex", r"(blocks)_(\d+)"])
+
+
+def test_read_config_from_file_compiles_block_regex(tmp_path, monkeypatch):
+    """TOML-supplied log_grad_metrics_block_regex must be validated/compiled the same
+    way as a CLI-supplied value, not left as a raw str (which crashes later at
+    block_regex.search(...))."""
+    from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('log_grad_metrics_block_regex = "_blocks_(\\\\d+)_"\n')
+
+    parser = setup_parser_common()
+    args, _ = parser.parse_known_args(["--config_file", str(config_path)])
+    # read_config_from_file's internal parser.parse_args(namespace=...) re-parses
+    # sys.argv (no explicit args list), so pin it to just the config_file flag.
+    monkeypatch.setattr("sys.argv", ["prog", "--config_file", str(config_path)])
+    args = read_config_from_file(args, parser)
+
+    assert isinstance(args.log_grad_metrics_block_regex, re.Pattern)
+    assert args.log_grad_metrics_block_regex.groups == 1
+
+
+def test_read_config_from_file_rejects_invalid_block_regex(tmp_path, monkeypatch):
+    """A malformed / wrong-group-count regex from a TOML config must fail at launch
+    with a clear error, not silently pass through as a raw string."""
+    from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('log_grad_metrics_block_regex = "_blocks_\\\\d+_"\n')  # no capture group
+
+    parser = setup_parser_common()
+    args, _ = parser.parse_known_args(["--config_file", str(config_path)])
+    monkeypatch.setattr("sys.argv", ["prog", "--config_file", str(config_path)])
+    with pytest.raises((SystemExit, ValueError)):
+        read_config_from_file(args, parser)
 
 
 def _named_params_with_grads(named_values: dict[str, list[float]]) -> list[tuple[str, nn.Parameter]]:
