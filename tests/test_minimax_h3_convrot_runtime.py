@@ -36,16 +36,20 @@ def _load_training_module(monkeypatch):
         decode_generation_visuals=noop,
         encode_audio_conditions=noop,
         encode_visual_conditions=noop,
+        fl_condition_entries=noop,
         load_generation_record=noop,
-        module_device_dtype=noop,
         parse_one_frame_options=noop,
     )
     _stub(
         monkeypatch,
         "musubi_tuner.minimax_h3.media",
         H3_AUDIO_SPEC=object(),
+        TARGET_FPS=24,
+        PyAVH3MediaDecoder=object,
         audio_latent_frames=noop,
+        module_device_dtype=noop,
         parse_inline_references=noop,
+        reject_one_frame_audio_references=noop,
         video_latent_frames=noop,
     )
     _stub(
@@ -64,6 +68,7 @@ def _load_training_module(monkeypatch):
         monkeypatch,
         "musubi_tuner.minimax_h3.text_encoder",
         TEACHER_CONDITIONS_REF="ref",
+        TEACHER_CONDITIONS_SUBJECT_REF="subject_ref",
         build_presentation=noop,
         encode_h3_presentation=noop,
         load_h3_processor=noop,
@@ -78,7 +83,6 @@ def _load_training_module(monkeypatch):
         VIDEO_VAE_ENCODE_DTYPE=torch.bfloat16,
         load_video_vae=noop,
     )
-    _stub(monkeypatch, "musubi_tuner.minimax_h3_cache_latents", PyAVH3MediaDecoder=object)
 
     def add_audio_train_args(parser):
         parser.add_argument("--audio_loss_weight", type=float, default=1.0)
@@ -192,6 +196,7 @@ def _load_generation_module(monkeypatch):
         decode_generation_visuals=noop,
         encode_audio_conditions=noop,
         encode_visual_conditions=noop,
+        fl_condition_entries=noop,
         load_generation_record=noop,
         parse_one_frame_options=noop,
     )
@@ -201,12 +206,6 @@ def _load_generation_module(monkeypatch):
         VIDEO_VAE_DECODE_DTYPE=torch.float16,
         VIDEO_VAE_ENCODE_DTYPE=torch.bfloat16,
         load_video_vae=noop,
-    )
-    _stub(
-        monkeypatch,
-        "musubi_tuner.minimax_h3_cache_latents",
-        PyAVH3MediaDecoder=object,
-        fingerprint_file=noop,
     )
     spec = importlib.util.spec_from_file_location(
         target,
@@ -234,15 +233,15 @@ def test_generation_selects_merge_for_bf16_and_attachment_for_int8(monkeypatch):
     int8 = SimpleNamespace(is_convrot_int8=True)
 
     # plain BF16 base: one-time destructive CPU merge
-    args = SimpleNamespace(lora_weight=["adapter.safetensors"], convrot_int8=False)
+    args = SimpleNamespace(lora_weight=["adapter.safetensors"], convrot_int8=False, lora_runtime_attach=False)
     assert generate._configure_lora_weights(bf16, args, device, prequantized=False) == []
     # pre-quantized INT8 base (auto-detected): runtime additive branches
     assert generate._configure_lora_weights(int8, args, device, prequantized=True) is attached
     # BF16 base + --convrot_int8: merged during the streaming load, nothing to do here
-    dynamic_args = SimpleNamespace(lora_weight=["adapter.safetensors"], convrot_int8=True)
+    dynamic_args = SimpleNamespace(lora_weight=["adapter.safetensors"], convrot_int8=True, lora_runtime_attach=False)
     assert generate._configure_lora_weights(int8, dynamic_args, device, prequantized=False) == []
     # no LoRA: nothing happens on any route
-    no_lora = SimpleNamespace(lora_weight=None, convrot_int8=False)
+    no_lora = SimpleNamespace(lora_weight=None, convrot_int8=False, lora_runtime_attach=False)
     assert generate._configure_lora_weights(bf16, no_lora, device, prequantized=False) == []
     # --lora_runtime_attach overrides both merge routes with runtime branches (the merge
     # rounds small-magnitude LoRAs -- e.g. teacher matching -- out of the BF16 weights)

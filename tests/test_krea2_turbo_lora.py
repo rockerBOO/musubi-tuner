@@ -3,7 +3,12 @@ RAW weights, alongside the LoRA being trained. Never merges into or mutates base
 
 import pytest
 
+import torch
+
+from types import SimpleNamespace
+
 from musubi_tuner.krea2 import krea2_utils
+from musubi_tuner.krea2.krea2_mmdit import SingleMMDiTConfig, SingleStreamDiT
 
 
 def _validate(**overrides):
@@ -50,7 +55,37 @@ def test_validate_still_rejects_nvfp4_with_turbo_dit():
         _validate(nvfp4=True, turbo_dit="turbo.safetensors")
 
 
-from types import SimpleNamespace
+@pytest.fixture
+def tiny_k2_config():
+    """Minimal K2 config for fast CPU tests -- not real weights.
+
+    features=32, heads=2 -> headdim=16 -> axes=[4,6,6] (sum=16, all even),
+    the constraint SingleStreamDiT.__init__ asserts on.
+    """
+    return SingleMMDiTConfig(
+        features=32,
+        tdim=32,
+        txtdim=32,
+        heads=2,
+        multiplier=1,
+        layers=3,
+        patch=2,
+        channels=4,
+        bias=False,
+        theta=1e3,
+        kvheads=None,
+        txtlayers=1,
+        txtheads=2,
+        txtkvheads=2,
+    )
+
+
+@pytest.fixture
+def tiny_k2_model(tiny_k2_config):
+    torch.manual_seed(0)
+    model = SingleStreamDiT(tiny_k2_config, attn_mode="torch")
+    model.eval()
+    return model
 
 
 def _trainer_args(**overrides):
@@ -127,7 +162,6 @@ def test_trainer_warns_turbo_lora_without_sample_prompts(caplog):
     assert "turbo_dit" in caplog.text.lower() or "turbo_lora" in caplog.text.lower()
 
 
-import torch
 from safetensors.torch import save_file
 
 

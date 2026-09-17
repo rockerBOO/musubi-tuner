@@ -10,7 +10,9 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from musubi_tuner.dataset.datasources import ImageDirectoryDatasource, ImageJsonlDatasource, ItemExtras, VideoDirectoryDatasource
 from musubi_tuner.minimax_h3.media import (
+    ONE_FRAME_REFERENCE_FRAME_CAP,
     H3AudioSource,
     H3MediaInfo,
     H3Record,
@@ -196,28 +198,57 @@ def test_records_from_jsonl_datasource_share_the_parsed_data(tmp_path: Path):
     datasource = VideoJsonlDatasource(str(jsonl))
     records = h3_records_from_datasource(datasource, "t2va", lambda path: H3MediaInfo(has_audio=False, duration_seconds=5.0))
 
-    assert len(records) == len(datasource.data) == 1
+    assert len(records) == len(datasource) == 1
     assert records[0].video_path == video
     assert records[0].caption == "caption"
     assert records[0].references == ()
+    assert records[0].label == "data.jsonl line 1"
 
 
 def test_records_from_directory_datasource_use_captions_and_resolved_paths(tmp_path: Path):
     video = _touch(tmp_path / "clip.mp4")
+    (tmp_path / "clip.txt").write_text("caption", encoding="utf-8")
 
-    class FakeDirectoryDatasource:
+    datasource = VideoDirectoryDatasource(str(tmp_path), ".txt")
+    records = h3_records_from_datasource(datasource, "t2va")
+
+    assert records == [H3Record(video_path=video, caption="caption", references=(), label=str(video))]
+
+    # a video directory item has no place for references, so Ref2VA needs a record-based dataset
+    with pytest.raises(ValueError, match="Ref2VA requires per-item references"):
+        h3_records_from_datasource(datasource, "ref2va")
+
+
+def test_records_read_only_the_shared_accessors_of_the_datasource(tmp_path: Path):
+    """The H3 record builder must not depend on the datasource implementation (no isinstance,
+    no JSONL internals): a minimal datasource exposing the shared accessors is enough."""
+    video = _touch(tmp_path / "clip.mp4")
+    face = _touch(tmp_path / "refs" / "face.png")
+
+    class MinimalDatasource:
         def __len__(self):
             return 1
 
         def get_caption(self, idx):
             return str(video), "caption"
 
-    records = h3_records_from_datasource(FakeDirectoryDatasource(), "t2va")
+        def get_item_extras(self, idx):
+            return ItemExtras(
+                fields={"references": [{"type": "image", "path": "refs/face.png"}], "teacher_caption": "teacher"},
+                base_directory=str(tmp_path),
+                label="custom item 1",
+            )
 
-    assert records == [H3Record(video_path=video, caption="caption", references=(), jsonl_line=0)]
+    (record,) = h3_records_from_datasource(MinimalDatasource(), "ref2va")
 
-    with pytest.raises(ValueError, match="Ref2VA requires video_jsonl_file"):
-        h3_records_from_datasource(FakeDirectoryDatasource(), "ref2va")
+    assert record.video_path == video
+    assert [(reference.type, reference.path) for reference in record.references] == [("image", face)]
+    assert record.teacher_caption == "teacher"
+    assert record.label == "custom item 1"
+    assert record.context == "H3 custom item 1"
+
+    with pytest.raises(ValueError, match="H3 custom item 1: references require task ref2va"):
+        h3_records_from_datasource(MinimalDatasource(), "t2va")
 
 
 def test_ref2va_reference_audio_resolution_and_media_paths(tmp_path: Path):
@@ -565,6 +596,46 @@ def test_h3_ref_teacher_text_rows_round_trip_through_the_bucket_collator(tmp_pat
     torch.testing.assert_close(batch["mmh3_teacher_ref_token_tags"][0], torch.tensor([1, 0, 0, 1, 1], dtype=torch.int64))
 
 
+def test_h3_subject_ref_teacher_text_keys_round_trip_through_the_bucket_collator(tmp_path: Path):
+    # the subject-reference teacher rows live next to a one-frame ref2va latent cache; the writer
+    # must accept the third teacher kind (smoke S1 regression: it only knew first,last and ref)
+    item = ItemInfo("view", "sks girl", (64, 64), (64, 64))
+    item.latent_cache_path = str(tmp_path / "view_0064x0064_mmh3.safetensors")
+    item.text_encoder_output_cache_path = str(tmp_path / "view_mmh3_te.safetensors")
+    latent_tensors = {
+        "latents_1x4x4_float32": torch.zeros(24, 1, 4, 4),
+        "latents_ref_000_image_1x4x4_float32": torch.ones(24, 1, 4, 4),
+        "latents_audio_32x2x2_float32": torch.zeros(32, 2, 2),
+        AUDIO_PRESENT_KEY: torch.tensor(0.0, dtype=torch.float32),
+        ONE_FRAME_TARGET_INDEX_KEY: torch.tensor(0, dtype=torch.int64),
+    }
+    text_tensors = {
+        "varlen_mmh3_hidden_states_bfloat16": torch.zeros(3, 5120, dtype=torch.bfloat16),
+        "varlen_mmh3_token_tags_int64": torch.tensor([1, 1, 1], dtype=torch.int64),
+        "varlen_mmh3_teacher_subject_ref_hidden_states_bfloat16": torch.zeros(5, 5120, dtype=torch.bfloat16),
+        "varlen_mmh3_teacher_subject_ref_token_tags_int64": torch.tensor([1, 0, 0, 1, 1], dtype=torch.int64),
+    }
+    save_latent_cache_minimax_h3(item, latent_tensors, {"task": "ref2va", "one_frame": "1"})
+    save_text_encoder_output_cache_minimax_h3(item, text_tensors, {"task": "t2va", "teacher_conditions": "subject_ref"})
+
+    batch = BucketBatchManager({(64, 64): [item]}, batch_size=1)[0]
+
+    assert batch["latents_ref_000_image"].shape == (1, 24, 1, 4, 4)
+    assert "mmh3_teacher_hidden_states" not in batch and "mmh3_teacher_ref_hidden_states" not in batch
+    assert batch["mmh3_teacher_subject_ref_hidden_states"][0].shape == (5, 5120)
+    torch.testing.assert_close(batch["mmh3_teacher_subject_ref_token_tags"][0], torch.tensor([1, 0, 0, 1, 1], dtype=torch.int64))
+
+    with pytest.raises(ValueError, match="mix"):
+        save_text_encoder_output_cache_minimax_h3(
+            item,
+            {
+                **text_tensors,
+                "varlen_mmh3_teacher_ref_hidden_states_bfloat16": torch.zeros(5, 5120, dtype=torch.bfloat16),
+                "varlen_mmh3_teacher_ref_token_tags_int64": torch.tensor([1, 0, 0, 1, 1], dtype=torch.int64),
+            },
+        )
+
+
 def test_h3_text_writer_rejects_a_one_sided_ref_teacher_pair_and_mixed_teacher_kinds(tmp_path: Path):
     item = _h3_item(tmp_path)
     student = {
@@ -662,7 +733,7 @@ def _cache_record(tmp_path: Path, references=()) -> H3Record:
         video_path=video,
         caption="scene and sound",
         references=tuple(references),
-        jsonl_line=1,
+        label="items.jsonl line 1",
     )
 
 
@@ -1041,7 +1112,7 @@ def test_h3_latent_writer_rejects_invalid_one_frame_target_indices(tmp_path: Pat
             save_latent_cache_minimax_h3(item, {**base, ONE_FRAME_TARGET_INDEX_KEY: index}, {"task": "t2va"})
 
 
-@pytest.mark.parametrize("control_indices", [[0], [0, 48]])
+@pytest.mark.parametrize("control_indices", [[0], [0, 48], [0, 24, 48]])
 def test_build_one_frame_latents_pack_controls_and_their_indices(tmp_path: Path, control_indices: list[int]):
     image_path = _touch(tmp_path / "target.png")
     video_vae = _FakeH3VideoVAE()
@@ -1061,7 +1132,8 @@ def test_build_one_frame_latents_pack_controls_and_their_indices(tmp_path: Path,
         control_indices=control_indices,
     )
 
-    expected_roles = ("first", "last")[: len(control_indices)]
+    # one-frame conditions are the ordered cond_{i} slots (any count), never the video first/last roles
+    expected_roles = tuple(f"cond_{index:03d}" for index in range(len(control_indices)))
     assert set(payload.tensors) == {
         "latents_1x4x4_float32",
         "latents_audio_32x2x2_float32",
@@ -1076,6 +1148,7 @@ def test_build_one_frame_latents_pack_controls_and_their_indices(tmp_path: Path,
     assert [call.shape for call in video_vae.calls] == [(1, 3, 1, 64, 64)] * (1 + len(control_indices))
     assert payload.metadata["task"] == "fl2va"
     assert payload.metadata["one_frame"] == "1"
+    assert payload.metadata["one_frame_format"] == "minimax-h3-one-frame-v2"
     assert payload.metadata["one_frame_control_indices"] == ";".join(str(index) for index in control_indices)
 
 
@@ -1084,10 +1157,7 @@ def test_build_one_frame_latents_pack_controls_and_their_indices(tmp_path: Path,
     [
         ({"control_frames": [torch.zeros(64, 64, 3, dtype=torch.uint8)]}, "together"),
         ({"control_indices": [0]}, "together"),
-        (
-            {"control_frames": [torch.zeros(64, 64, 3, dtype=torch.uint8)] * 3, "control_indices": [0, 1, 2]},
-            "1 or 2 control images",
-        ),
+        ({"control_frames": [], "control_indices": []}, "at least one control image"),
         (
             {"control_frames": [torch.zeros(64, 64, 3, dtype=torch.uint8)], "control_indices": [0, 48]},
             "does not match",
@@ -1149,11 +1219,375 @@ def test_one_frame_control_cache_keys_round_trip_through_the_bucket_collator(tmp
     torch.testing.assert_close(batch["one_frame_control_indices"], torch.tensor([[0]], dtype=torch.int64))
 
 
+def _one_frame_reference_record(tmp_path: Path, *, with_video: bool = True, with_audio_reference: bool = False) -> H3Record:
+    image = _touch(tmp_path / "refs" / "face.png")
+    references = [H3Reference(type="image", path=image)]
+    if with_video:
+        video = _touch(tmp_path / "refs" / "motion.mp4")
+        references.append(
+            H3Reference(type="video", path=video, audio=H3AudioSource(path=video, embedded=True), duration_seconds=4.0)
+        )
+    if with_audio_reference:
+        voice = _touch(tmp_path / "refs" / "voice.wav")
+        references.append(
+            H3Reference(type="audio", path=voice, audio=H3AudioSource(path=voice, embedded=False), duration_seconds=1.0)
+        )
+    return H3Record(
+        video_path=_touch(tmp_path / "target.png"),
+        caption="a novel view of the character",
+        references=tuple(references),
+        label="items.jsonl line 1",
+    )
+
+
+def test_build_one_frame_latents_pack_references_under_numbered_roles(tmp_path: Path):
+    record = _one_frame_reference_record(tmp_path)
+    image, video = (reference.path for reference in record.references)
+    decoder = _FakeH3MediaDecoder(
+        visuals={
+            image: torch.zeros(1, 32, 64, 3, dtype=torch.uint8),
+            video: torch.zeros(5, 64, 32, 3, dtype=torch.uint8),
+        }
+    )
+    video_vae = _FakeH3VideoVAE()
+    audio_vae = _FakeH3AudioVAE()
+
+    payload = build_one_frame_latent_tensors(
+        image_frames=torch.zeros(64, 64, 3, dtype=torch.uint8),
+        target_index=24,
+        video_vae=video_vae,
+        silence_audio_latent=torch.zeros(32, 2, 2),
+        cache_seed=123,
+        item_key=str(record.video_path),
+        video_vae_fingerprint="video-fingerprint",
+        audio_vae_fingerprint="audio-fingerprint",
+        media_fingerprints={record.video_path: "target-image", image: "face", video: "motion"},
+        record=record,
+        audio_vae=audio_vae,
+        media_decoder=decoder,
+    )
+
+    assert set(payload.tensors) == {
+        "latents_1x4x4_float32",
+        "latents_audio_32x2x2_float32",
+        AUDIO_PRESENT_KEY,
+        ONE_FRAME_TARGET_INDEX_KEY,
+        "latents_ref_000_image_1x2x4_float32",
+        "latents_ref_001_video_2x4x2_float32",
+        "latents_ref_001_audio_32x2x8_float32",
+    }
+    assert ONE_FRAME_CONTROL_INDICES_KEY not in payload.tensors
+    # references are decoded with the one-frame policy: images capped to the target area,
+    # videos to the released 15 s span (not a target duration, which a single frame lacks)
+    assert [(call[1], call[2]) for call in decoder.visual_calls] == [(ONE_FRAME_REFERENCE_FRAME_CAP, (64, 64))] * 2
+    # the reference video keeps its own audio duration
+    assert decoder.audio_calls[0][1:] == (0, 6400, True)
+    assert [call.shape for call in video_vae.calls] == [(1, 3, 1, 64, 64), (1, 3, 1, 32, 64), (1, 3, 5, 64, 32)]
+    assert payload.metadata["task"] == "ref2va"
+    assert payload.metadata["one_frame"] == "1"
+    assert payload.metadata["one_frame_target_index"] == "24"
+    assert "one_frame_control_indices" not in payload.metadata
+    assert json.loads(payload.metadata["media_fingerprints"]) == {
+        str(record.video_path): "target-image",
+        str(image): "face",
+        str(video): "motion",
+    }
+
+
+@pytest.mark.parametrize(
+    ("record_kwargs", "overrides", "message"),
+    [
+        ({"with_audio_reference": True}, {}, "standalone audio references"),
+        ({}, {"control_frames": [torch.zeros(64, 64, 3, dtype=torch.uint8)], "control_indices": [0]}, "cannot combine"),
+        ({}, {"media_decoder": None}, "media decoder"),
+        ({}, {"audio_vae": None}, "audio VAE"),
+    ],
+)
+def test_build_one_frame_latents_reject_invalid_references(tmp_path: Path, record_kwargs: dict, overrides: dict, message: str):
+    record = _one_frame_reference_record(tmp_path, **record_kwargs)
+    decoder = _FakeH3MediaDecoder(
+        visuals={reference.path: torch.zeros(1, 64, 64, 3, dtype=torch.uint8) for reference in record.references}
+    )
+    video_vae = _FakeH3VideoVAE()
+    inputs = dict(
+        image_frames=torch.zeros(64, 64, 3, dtype=torch.uint8),
+        target_index=24,
+        video_vae=video_vae,
+        silence_audio_latent=torch.zeros(32, 2, 2),
+        cache_seed=0,
+        item_key=str(record.video_path),
+        video_vae_fingerprint="video-fingerprint",
+        audio_vae_fingerprint="audio-fingerprint",
+        media_fingerprints={},
+        record=record,
+        audio_vae=_FakeH3AudioVAE(),
+        media_decoder=decoder,
+    )
+    inputs.update(overrides)
+
+    with pytest.raises(ValueError, match=message):
+        build_one_frame_latent_tensors(**inputs)
+
+    assert video_vae.calls == []
+
+
+def test_one_frame_reference_cache_keys_round_trip_through_the_bucket_collator(tmp_path: Path):
+    item = ItemInfo("view", "a reference caption", (64, 64), (64, 64))
+    item.latent_cache_path = str(tmp_path / "view_0064x0064_mmh3.safetensors")
+    item.text_encoder_output_cache_path = str(tmp_path / "view_mmh3_te.safetensors")
+    latent_tensors = {
+        "latents_1x4x4_float32": torch.zeros(24, 1, 4, 4),
+        "latents_ref_000_image_1x4x4_float32": torch.ones(24, 1, 4, 4),
+        "latents_audio_32x2x2_float32": torch.zeros(32, 2, 2),
+        AUDIO_PRESENT_KEY: torch.tensor(0.0, dtype=torch.float32),
+        ONE_FRAME_TARGET_INDEX_KEY: torch.tensor(24, dtype=torch.int64),
+    }
+    text_tensors = {
+        "varlen_mmh3_hidden_states_bfloat16": torch.zeros(3, 5120, dtype=torch.bfloat16),
+        "varlen_mmh3_token_tags_int64": torch.tensor([1, 0, 1], dtype=torch.int64),
+    }
+    save_latent_cache_minimax_h3(item, latent_tensors, {"task": "ref2va", "one_frame": "1"})
+    save_text_encoder_output_cache_minimax_h3(item, text_tensors, {"task": "ref2va"})
+
+    manager = BucketBatchManager({(64, 64): [item]}, batch_size=1)
+    batch = manager[0]
+
+    assert batch["latents"].shape == (1, 24, 1, 4, 4)
+    assert batch["latents_ref_000_image"].shape == (1, 24, 1, 4, 4)
+    torch.testing.assert_close(batch["one_frame_target_index"], torch.tensor([24], dtype=torch.int64))
+
+
+def test_h3_image_records_come_from_the_image_jsonl_aligned_with_datasource_indices(tmp_path: Path):
+    target = _touch(tmp_path / "data" / "target.png")
+    face = _touch(tmp_path / "data" / "refs" / "face.png")
+    jsonl = tmp_path / "data" / "items.jsonl"
+    _write_jsonl(
+        jsonl,
+        [
+            {
+                "image_path": str(target),
+                "caption": "a novel view",
+                "references": [{"type": "image", "path": "refs/face.png"}],
+            }
+        ],
+    )
+    datasource = ImageJsonlDatasource(str(jsonl), control_count_per_image=1)
+
+    records = h3_records_from_datasource(datasource, "ref2va")
+
+    # one record per datasource index (ItemInfo.datasource_index), references resolved from the JSONL directory
+    assert len(records) == 1
+    record = records[0]
+    assert record.video_path == target
+    assert record.caption == "a novel view"
+    assert [(reference.type, reference.path) for reference in record.references] == [("image", face)]
+    assert record.label == "items.jsonl line 1"
+
+    with pytest.raises(ValueError, match="H3 items.jsonl line 1: references require task ref2va"):
+        h3_records_from_datasource(datasource, "t2va")
+
+
+def test_h3_records_carry_the_optional_teacher_caption(tmp_path: Path):
+    target = _touch(tmp_path / "target.png")
+    face = _touch(tmp_path / "face.png")
+    video = _touch(tmp_path / "clip.mp4")
+    jsonl = tmp_path / "items.jsonl"
+    _write_jsonl(
+        jsonl,
+        [
+            {"image_path": str(target), "caption": "c", "references": [{"type": "image", "path": "face.png"}]},
+            {
+                "image_path": str(face),
+                "caption": "c",
+                "teacher_caption": "subject_definitions:\n<Subject 1> ...",
+                "references": [{"type": "image", "path": "target.png"}],
+            },
+        ],
+    )
+
+    records = h3_records_from_datasource(ImageJsonlDatasource(str(jsonl), control_count_per_image=1), "ref2va")
+
+    assert records[0].teacher_caption is None
+    assert records[1].teacher_caption == "subject_definitions:\n<Subject 1> ..."
+
+    video_jsonl = tmp_path / "videos.jsonl"
+    _write_jsonl(
+        video_jsonl,
+        [{"video_path": "clip.mp4", "caption": "c", "teacher_caption": "t", "references": [{"type": "image", "path": "face.png"}]}],
+    )
+    (video_record,) = load_h3_jsonl_records(video_jsonl, "ref2va", lambda path: H3MediaInfo(has_audio=False, duration_seconds=6.0))
+    assert video_record.teacher_caption == "t"
+    assert video_record.video_path == video
+
+    _write_jsonl(
+        jsonl,
+        [{"image_path": str(target), "caption": "c", "teacher_caption": "", "references": [{"type": "image", "path": "face.png"}]}],
+    )
+    with pytest.raises(ValueError, match="teacher_caption must be a non-empty string"):
+        h3_records_from_datasource(ImageJsonlDatasource(str(jsonl), control_count_per_image=1), "ref2va")
+
+
+def _image_with_controls_datasource(tmp_path: Path, control_count: int) -> ImageDirectoryDatasource:
+    """An image_directory / control_directory pair: target.png with target_{i}.png controls in order."""
+    images = tmp_path / "images"
+    controls = tmp_path / "controls"
+    _touch(images / "target.png")
+    (images / "target.txt").write_text("a character in a pose on a background", encoding="utf-8")
+    for index in range(control_count):
+        _touch(controls / f"target_{index}.png")
+    return ImageDirectoryDatasource(str(images), ".txt", str(controls), None, False)
+
+
+def test_h3_control_images_become_ordered_image_references_for_ref2va(tmp_path: Path):
+    datasource = _image_with_controls_datasource(tmp_path, 3)  # character, pose, background
+
+    (record,) = h3_records_from_datasource(datasource, "ref2va", control_images_as_references=True)
+
+    assert record.video_path == (tmp_path / "images" / "target.png").resolve()
+    assert [(reference.type, reference.path.name) for reference in record.references] == [
+        ("image", "target_0.png"),
+        ("image", "target_1.png"),
+        ("image", "target_2.png"),
+    ]
+    assert record.teacher_caption is None
+
+    # the same control images are timed FL2VA controls (not references) for the other tasks
+    (fl_record,) = h3_records_from_datasource(datasource, "fl2va", control_images_as_references=True)
+    assert fl_record.references == ()
+    # ... and without the opt-in the directory dataset still cannot provide references
+    with pytest.raises(ValueError, match="control images as untimed references"):
+        h3_records_from_datasource(datasource, "ref2va")
+
+
+def test_h3_jsonl_control_paths_become_references_unless_the_record_has_its_own(tmp_path: Path):
+    target = _touch(tmp_path / "target.png")
+    char = _touch(tmp_path / "char.png")
+    pose = _touch(tmp_path / "pose.png")
+    face = _touch(tmp_path / "refs" / "face.png")
+    jsonl = tmp_path / "items.jsonl"
+    _write_jsonl(
+        jsonl,
+        [
+            {"image_path": str(target), "caption": "c", "control_path_0": str(char), "control_path_1": str(pose)},
+            {"image_path": str(char), "caption": "c", "references": [{"type": "image", "path": "refs/face.png"}]},
+        ],
+    )
+
+    records = h3_records_from_datasource(ImageJsonlDatasource(str(jsonl), None), "ref2va", control_images_as_references=True)
+
+    assert [reference.path for reference in records[0].references] == [char, pose]
+    assert [reference.path for reference in records[1].references] == [face]
+
+    # a record cannot carry both control images and references
+    _write_jsonl(
+        jsonl,
+        [
+            {
+                "image_path": str(target),
+                "caption": "c",
+                "control_path": str(char),
+                "references": [{"type": "image", "path": "refs/face.png"}],
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="items.jsonl line 1: cannot combine control images with references"):
+        h3_records_from_datasource(ImageJsonlDatasource(str(jsonl), None), "ref2va", control_images_as_references=True)
+
+    # the Ref2VA limits apply to control-derived references too
+    _write_jsonl(jsonl, [{"image_path": str(target), "caption": "c", **{f"control_path_{i}": str(char) for i in range(10)}}])
+    with pytest.raises(ValueError, match="at most 9 image references"):
+        h3_records_from_datasource(ImageJsonlDatasource(str(jsonl), None), "ref2va", control_images_as_references=True)
+
+
+@pytest.mark.parametrize(
+    ("has_control", "indices", "task", "record_task", "message"),
+    [
+        (False, None, "t2va", None, None),
+        (False, None, "fl2va", None, "requires image datasets with control images"),
+        (False, None, "ref2va", None, None),  # references come from the JSONL records (checked at record building)
+        (True, [0], "fl2va", None, None),
+        (True, [0], "t2va", None, "time-annotated control images .* require --task fl2va"),
+        (True, [0], "ref2va", None, "time-annotated control images .* require --task fl2va"),
+        (True, None, "ref2va", None, None),
+        (True, None, "t2va", "ref2va", None),  # subject-reference teacher: the records are built as ref2va
+        (True, None, "t2va", None, "untimed references"),
+        (True, None, "fl2va", None, "untimed references"),
+    ],
+)
+def test_h3_image_dataset_task_matrix(has_control, indices, task, record_task, message):
+    from types import SimpleNamespace
+
+    from musubi_tuner.minimax_h3_cache_latents import validate_h3_image_dataset_task
+
+    dataset = SimpleNamespace(has_control=has_control, fp_1f_clean_indices=indices)
+    if message is None:
+        validate_h3_image_dataset_task(dataset, task, True, record_task)
+    else:
+        with pytest.raises(ValueError, match=message):
+            validate_h3_image_dataset_task(dataset, task, True, record_task)
+    with pytest.raises(ValueError, match="require --one_frame"):
+        validate_h3_image_dataset_task(dataset, task, False, record_task)
+
+
+def test_h3_image_records_require_references_for_ref2va_and_reject_duplicates(tmp_path: Path):
+    directory = tmp_path / "images"
+    image = _touch(directory / "plain.png")
+    (directory / "plain.txt").write_text("plain caption", encoding="utf-8")
+    directory_datasource = ImageDirectoryDatasource(str(directory), ".txt", None, 1, False)
+
+    # image directories build plain records (t2va / fl2va) but cannot carry references
+    assert h3_records_from_datasource(directory_datasource, "t2va") == [
+        H3Record(video_path=image, caption="plain caption", references=(), label=str(image))
+    ]
+    with pytest.raises(ValueError, match="Ref2VA requires per-item references"):
+        h3_records_from_datasource(directory_datasource, "ref2va")
+
+    target = _touch(tmp_path / "target.png")
+    face = _touch(tmp_path / "face.png")
+    jsonl = tmp_path / "items.jsonl"
+    line = {"image_path": str(target), "caption": "c", "references": [{"type": "image", "path": str(face)}]}
+    _write_jsonl(jsonl, [line, line])
+
+    with pytest.raises(ValueError, match="items.jsonl line 2: duplicate target"):
+        h3_records_from_datasource(ImageJsonlDatasource(str(jsonl), control_count_per_image=1), "ref2va")
+
+    # a record without references among records that have them fails on its own line
+    _write_jsonl(jsonl, [line, {"image_path": str(face), "caption": "c"}])
+    with pytest.raises(ValueError, match="items.jsonl line 2: Ref2VA requires at least one visual reference"):
+        h3_records_from_datasource(ImageJsonlDatasource(str(jsonl), control_count_per_image=1), "ref2va")
+
+
+def test_one_frame_format_tag_makes_skip_existing_rebuild_pre_cond_caches(tmp_path: Path):
+    from safetensors.torch import save_file
+
+    from musubi_tuner.minimax_h3_cache_latents import build_latent_metadata
+
+    expected = build_latent_metadata(
+        task="fl2va",
+        crop_start_frame=0,
+        cache_seed=0,
+        video_vae_fingerprint="v",
+        audio_vae_fingerprint="a",
+        media_fingerprints={},
+        one_frame_target_index=24,
+        one_frame_control_indices=[0],
+    )
+    assert expected["one_frame_format"] == "minimax-h3-one-frame-v2"
+
+    # a cache written before the ordered cond_ slots carries every other key but not the one-frame format tag
+    legacy = {key: value for key, value in expected.items() if key != "one_frame_format"}
+    path = tmp_path / "legacy.safetensors"
+    save_file({"latents_1x4x4_float32": torch.zeros(24, 1, 4, 4)}, str(path), metadata=legacy)
+    assert not cache_metadata_matches(path, expected)
+    save_file({"latents_1x4x4_float32": torch.zeros(24, 1, 4, 4)}, str(path), metadata=expected)
+    assert cache_metadata_matches(path, expected)
+
+
 def test_h3_latent_writer_rejects_invalid_one_frame_control_indices(tmp_path: Path):
     item = _h3_item(tmp_path)
     base = {
         "latents_1x4x4_float32": torch.zeros(24, 1, 4, 4),
-        "latents_first_1x4x4_float32": torch.zeros(24, 1, 4, 4),
+        "latents_cond_000_1x4x4_float32": torch.zeros(24, 1, 4, 4),
         "latents_audio_32x2x2_float32": torch.zeros(32, 2, 2),
         AUDIO_PRESENT_KEY: torch.tensor(0.0, dtype=torch.float32),
         ONE_FRAME_TARGET_INDEX_KEY: torch.tensor(24, dtype=torch.int64),
@@ -1162,7 +1596,7 @@ def test_h3_latent_writer_rejects_invalid_one_frame_control_indices(tmp_path: Pa
         torch.tensor(0, dtype=torch.int64),
         torch.tensor([0], dtype=torch.int32),
         torch.tensor([-1], dtype=torch.int64),
-        torch.tensor([0, 1, 2], dtype=torch.int64),
+        torch.tensor([], dtype=torch.int64),
         torch.zeros(1, 1, dtype=torch.int64),
     )
     for indices in invalid:

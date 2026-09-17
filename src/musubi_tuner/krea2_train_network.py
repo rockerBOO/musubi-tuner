@@ -102,7 +102,8 @@ class Krea2NetworkTrainer(NetworkTrainer):
         if args.turbo_dit_cache and not args.turbo_dit:
             raise ValueError("--turbo_dit_cache (M1, resident Turbo weights) requires --turbo_dit.")
         # --turbo_dit swaps base weights from outside the model; the block-swap offloader's own
-        # CPU master never sees that swap, producing a RAW/Turbo weight mix.
+        # CPU master never sees that swap, producing a RAW/Turbo weight mix. --turbo_lora never
+        # swaps weights (only composes a LoRA hook), so it is not restricted here.
         if args.turbo_dit and args.blocks_to_swap:
             raise ValueError(
                 "--turbo_dit (Turbo sample generation) is not supported together with --blocks_to_swap: "

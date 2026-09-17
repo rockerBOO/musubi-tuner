@@ -8,25 +8,28 @@ import numpy as np
 from PIL import Image
 import torch
 
+from musubi_tuner.dataset.media_utils import resize_image_to_bucket
 from musubi_tuner.minimax_h3.audio_vae import encode_audio_mode
 from musubi_tuner.minimax_h3.media import (
+    ONE_FRAME_REFERENCE_FRAME_CAP,
     TARGET_FPS,
+    TEXT_VISUAL_FPS,
+    TEXT_VISUAL_FRAME_STRIDE,
+    H3MediaDecoder,
     H3Record,
     audio_latent_frames,
     load_h3_jsonl_records,
+    module_device_dtype,
     parse_inline_references,
+    prepare_pixels,
     waveform_samples,
 )
-from musubi_tuner.minimax_h3.packing import H3ReferenceGeometry, H3VideoGeometry
+from musubi_tuner.minimax_h3.packing import H3ReferenceGeometry, H3VideoGeometry, one_frame_condition_role
 from musubi_tuner.minimax_h3.text_encoder import H3TextVisual
 from musubi_tuner.minimax_h3.video_vae import VIDEO_VAE_ENCODE_DTYPE, encode_video_condition
-from musubi_tuner.minimax_h3_cache_latents import PyAVH3MediaDecoder
 
 
 VIDEO_VAE_SPATIAL_RATIO = 16
-# with a one-frame target, reference videos keep their full released span instead of
-# being capped by the target duration
-ONE_FRAME_REFERENCE_FRAME_CAP = 15 * TARGET_FPS
 
 
 def parse_one_frame_options(spec: str) -> tuple[int, tuple[int, ...] | None]:
@@ -63,40 +66,32 @@ def parse_one_frame_options(spec: str) -> tuple[int, tuple[int, ...] | None]:
 
 
 def dummy_record(prompt: str) -> H3Record:
-    return H3Record(
-        video_path=Path("."),
-        caption=prompt,
-        references=(),
-        jsonl_line=0,
-    )
+    return H3Record(video_path=Path("."), caption=prompt, references=(), label="--prompt")
 
 
 def load_image_frames(path: str | Path, *, width: int, height: int) -> torch.Tensor:
+    """An FL2VA condition image as a uint8 [1,H,W,3] frame on the target canvas.
+
+    The image is fitted the way the dataset layer fits training targets and control images
+    (``resize_image_to_bucket``: scale to cover the canvas, then center crop), so a LoRA sees
+    its conditions preprocessed exactly as during training. The released Diffusers pipeline
+    instead stretches the first picture onto the canvas and cover-crops the rest; training
+    parity is preferred here, the stretch never being a no-op with an explicit canvas.
+    """
     with Image.open(path) as image:
-        image = image.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
-        pixels = torch.from_numpy(np.asarray(image).copy())
-    return pixels.unsqueeze(0)
+        pixels = resize_image_to_bucket(np.asarray(image.convert("RGB")), (width, height))
+    return torch.from_numpy(np.ascontiguousarray(pixels)).unsqueeze(0)
 
 
-def prepare_pixels(frames: torch.Tensor) -> torch.Tensor:
-    if frames.ndim != 4 or frames.shape[-1] != 3:
-        raise ValueError(f"MiniMax-H3 condition pixels must be [F,H,W,3], got {tuple(frames.shape)}")
-    if frames.dtype == torch.uint8:
-        frames = frames.float().div(127.5).sub(1.0)
-    else:
-        frames = frames.float().mul(2.0).sub(1.0)
-    return frames.permute(3, 0, 1, 2).unsqueeze(0).contiguous()
-
-
-def load_generation_record(args) -> H3Record:
+def load_generation_record(args, *, ref_base_directory: str | Path | None = None) -> H3Record:
+    """The H3 record of a generation request; ``--ref`` paths resolve from ref_base_directory
+    (the CLI resolves them from the working directory, training samples from the prompt file)."""
     if args.task in {"t2va", "fl2va"}:
         return dummy_record(args.prompt or "")
 
-    ref_specs = getattr(args, "ref", None)
-    if ref_specs:
-        base_directory = Path(getattr(args, "ref_base_directory", None) or Path.cwd())
-        references = parse_inline_references(ref_specs, base_directory)
-        return H3Record(video_path=Path("."), caption=args.prompt or "", references=references, jsonl_line=0)
+    if args.ref:
+        references = parse_inline_references(args.ref, Path(ref_base_directory or Path.cwd()))
+        return H3Record(video_path=Path("."), caption=args.prompt or "", references=references, label="--ref")
 
     records = load_h3_jsonl_records(args.reference_jsonl, "ref2va")
     if args.reference_index >= len(records):
@@ -107,15 +102,40 @@ def load_generation_record(args) -> H3Record:
     return record
 
 
-def decode_generation_visuals(args, record: H3Record, decoder: PyAVH3MediaDecoder):
+def fl_condition_entries(args) -> tuple[tuple[str, str], ...]:
+    """The FL2VA condition images of a generation request as ordered (role, path) pairs.
+
+    Video targets take the released ``first``/``last`` anchors (``--first_frame`` /
+    ``--last_frame``). One-frame targets take an ordered list of any length: the repeatable
+    ``--condition_image`` (``--ci`` in prompt lines), or, as aliases for the first two slots,
+    ``--first_frame`` / ``--last_frame``; the roles are the ``cond_{i}`` slots and the times come
+    from ``--one_frame control_index`` in the same order.
+    """
+    first_frame = args.first_frame
+    last_frame = args.last_frame
+    condition_images = args.condition_image or ()
+    if args.frame_count != 1:
+        if condition_images:
+            raise ValueError(
+                "MiniMax-H3 --condition_image applies to one-frame targets (--frame_count 1); video FL2VA takes"
+                " --first_frame and/or --last_frame"
+            )
+        return tuple((role, path) for role, path in (("first", first_frame), ("last", last_frame)) if path)
+    if condition_images and (first_frame or last_frame):
+        raise ValueError(
+            "MiniMax-H3 one-frame FL2VA takes either --condition_image entries or --first_frame/--last_frame, not both"
+        )
+    paths = list(condition_images) if condition_images else [path for path in (first_frame, last_frame) if path]
+    return tuple((one_frame_condition_role(index), path) for index, path in enumerate(paths))
+
+
+def decode_generation_visuals(args, record: H3Record, decoder: H3MediaDecoder):
     raw_visuals = {}
     text_visuals = {}
     if args.task == "t2va":
         return raw_visuals, text_visuals
     if args.task == "fl2va":
-        for role, path in (("first", args.first_frame), ("last", args.last_frame)):
-            if path is None:
-                continue
+        for role, path in fl_condition_entries(args):
             frames = load_image_frames(path, width=args.width, height=args.height)
             raw_visuals[role] = frames
             text_visuals[role] = H3TextVisual(frames)
@@ -126,7 +146,7 @@ def decode_generation_visuals(args, record: H3Record, decoder: PyAVH3MediaDecode
     else:
         # cap reference videos by the real target duration in native 24 fps frames; a
         # temporal stretch makes that duration exceed frame_count generated frames
-        reference_frame_cap = args.frame_count * TARGET_FPS // getattr(args, "output_fps", TARGET_FPS)
+        reference_frame_cap = args.frame_count * TARGET_FPS // args.output_fps
     for reference in record.references:
         if reference.type not in {"image", "video"}:
             continue
@@ -139,19 +159,12 @@ def decode_generation_visuals(args, record: H3Record, decoder: PyAVH3MediaDecode
         if reference.type == "image":
             text_visuals[reference.path] = H3TextVisual(frames)
         else:
-            sampled = frames[::12]
+            sampled = frames[::TEXT_VISUAL_FRAME_STRIDE]
             text_visuals[reference.path] = H3TextVisual(
                 sampled,
-                tuple(index / 2.0 for index in range(sampled.shape[0])),
+                tuple(index / TEXT_VISUAL_FPS for index in range(sampled.shape[0])),
             )
     return raw_visuals, text_visuals
-
-
-def module_device_dtype(module, fallback_dtype: torch.dtype) -> tuple[torch.device, torch.dtype]:
-    for tensor in (*module.parameters(), *module.buffers()):
-        if tensor.is_floating_point():
-            return tensor.device, tensor.dtype
-    return torch.device("cpu"), fallback_dtype
 
 
 @torch.no_grad()
@@ -167,9 +180,8 @@ def encode_visual_conditions(args, record, raw_visuals, video_vae):
         return H3VideoGeometry(*latent.shape[2:])
 
     if args.task == "fl2va":
-        for role in ("first", "last"):
-            if role in raw_visuals:
-                visual_geometries.append(encode_visual(raw_visuals[role]))
+        for role, _ in fl_condition_entries(args):
+            visual_geometries.append(encode_visual(raw_visuals[role]))
     elif args.task == "ref2va":
         for index, reference in enumerate(record.references):
             if reference.type in {"image", "video"}:
@@ -201,7 +213,7 @@ def encode_audio_conditions(
         else:
             # standalone audio spans the target duration (stretched when --output_fps lowers the
             # sampling rate); one-frame generation rejects it upstream
-            frames = audio_latent_frames(args.frame_count, output_fps=getattr(args, "output_fps", TARGET_FPS))
+            frames = audio_latent_frames(args.frame_count, output_fps=args.output_fps)
             require_exact = False
         waveform = decoder.decode_audio(
             reference.audio,

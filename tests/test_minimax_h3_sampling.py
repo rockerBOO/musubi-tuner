@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
+from PIL import Image
 import pytest
 import torch
 from safetensors.torch import save_file
@@ -11,6 +14,7 @@ from safetensors.torch import save_file
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from musubi_tuner.dataset.media_utils import resize_image_to_bucket
 from musubi_tuner.minimax_h3.packing import H3VideoGeometry, build_h3_layout
 from musubi_tuner.minimax_h3.sampling import (
     augment_condition_latents,
@@ -21,12 +25,13 @@ from musubi_tuner.minimax_h3.sampling import (
     sample_joint_av,
     write_joint_av,
 )
-from musubi_tuner.minimax_h3.generation_inputs import load_generation_record, parse_one_frame_options
+from musubi_tuner.minimax_h3.generation_inputs import load_generation_record, load_image_frames, parse_one_frame_options
 from musubi_tuner.minimax_h3.packing import FRAME_RESCALE, H3TimeOverrides
 from musubi_tuner.minimax_h3.sampling import write_image
 from musubi_tuner.minimax_h3_generate_video import (
     _one_frame_time_overrides,
     load_cached_text_conditioning,
+    setup_parser,
     validate_generation_args,
 )
 
@@ -287,6 +292,17 @@ def test_joint_output_uses_a_replaceable_mux_boundary(tmp_path):
     }
 
 
+def _parser_defaults() -> dict[str, object]:
+    # the script reads plain argparse attributes, so the fake args start from the real parser
+    # defaults and only spell out the values the tests choose
+    parser = setup_parser()
+    return {
+        action.dest: action.default
+        for action in parser._actions
+        if action.dest != "help" and action.default is not argparse.SUPPRESS
+    }
+
+
 def _generation_args(tmp_path, *, task="t2va", **overrides):
     paths = {}
     for name in ("dit", "video_vae", "audio_vae", "text_encoder"):
@@ -294,6 +310,7 @@ def _generation_args(tmp_path, *, task="t2va", **overrides):
         path.touch()
         paths[name] = str(path)
     values = {
+        **_parser_defaults(),
         **paths,
         "task": task,
         "prompt": "a test prompt",
@@ -313,6 +330,9 @@ def _generation_args(tmp_path, *, task="t2va", **overrides):
         "steps": 2,
         "seed": 1,
         "output": str(tmp_path / "output.mp4"),
+        "output_type": "video",
+        "output_name": None,
+        "condition_image": None,
         "blocks_to_swap": 0,
         "h3_shift_video": 12.0,
         "h3_shift_audio": 3.0,
@@ -371,6 +391,22 @@ def test_generation_validation_accepts_inline_refs_exclusively_with_reference_js
         )
 
 
+def test_condition_images_are_cover_cropped_to_the_canvas_like_training_controls(tmp_path):
+    # a 200x100 picture with a green stripe on its left edge, onto a square 100x100 canvas:
+    # training fits controls with resize_image_to_bucket (scale to cover, center crop), so the
+    # stripe falls outside the crop; a stretch would keep it, squeezed
+    pixels = np.zeros((100, 200, 3), dtype=np.uint8)
+    pixels[:, :20, 1] = 255
+    path = tmp_path / "condition.png"
+    Image.fromarray(pixels).save(path)
+
+    frames = load_image_frames(path, width=100, height=100)
+
+    assert frames.shape == (1, 100, 100, 3) and frames.dtype == torch.uint8
+    assert int(frames[..., 1].max()) == 0
+    assert torch.equal(frames[0], torch.from_numpy(resize_image_to_bucket(pixels, (100, 100))))
+
+
 def test_load_generation_record_builds_inline_ref_records_without_a_jsonl(tmp_path):
     refs_directory = tmp_path / "refs"
     refs_directory.mkdir()
@@ -384,10 +420,10 @@ def test_load_generation_record_builds_inline_ref_records_without_a_jsonl(tmp_pa
             task="ref2va",
             prompt="a cat sings",
             ref=["refs/face.png", "refs/style.webp"],
-            ref_base_directory=str(tmp_path),
             reference_jsonl=None,
             reference_index=0,
-        )
+        ),
+        ref_base_directory=str(tmp_path),
     )
 
     assert record.caption == "a cat sings"
@@ -447,9 +483,9 @@ def test_generation_validation_gates_the_one_frame_mode(tmp_path):
             one_frame="target_index=24,control_index=0",
         )
     )
-    with pytest.raises(ValueError, match="one entry per provided frame"):
+    with pytest.raises(ValueError, match="one entry per condition image"):
         validate_generation_args(_generation_args(tmp_path, task="fl2va", frame_count=1, output=png, first_frame=str(first)))
-    with pytest.raises(ValueError, match="one entry per provided frame"):
+    with pytest.raises(ValueError, match="one entry per condition image"):
         validate_generation_args(
             _generation_args(
                 tmp_path,

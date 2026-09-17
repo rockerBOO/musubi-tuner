@@ -51,8 +51,8 @@ AUDIO_PRESENT_KEY = "audio_present_float32"
 #   loads tensors; the trainer converts it to a RoPE time override at layout-build time.
 ONE_FRAME_TARGET_INDEX_KEY = "one_frame_target_index_int64"
 
-# - ONE_FRAME_CONTROL_INDICES_KEY holds an int64 [K] tensor (K = 1..2) with the 24 fps
-#   pixel-frame indices of the one-frame visual conditions, in packed (first, last) order.
+# - ONE_FRAME_CONTROL_INDICES_KEY holds an int64 [K] tensor (K >= 1) with the 24 fps
+#   pixel-frame indices of the one-frame visual conditions, in cond_{i} slot order.
 #   Present only when the cache carries condition latents; same tensor-not-metadata rationale.
 ONE_FRAME_CONTROL_INDICES_KEY = "one_frame_control_indices_int64"
 
@@ -68,8 +68,8 @@ def append_one_frame_target_index_entry(sd: dict[str, torch.Tensor], target_inde
 
 
 def append_one_frame_control_indices_entry(sd: dict[str, torch.Tensor], control_indices: list[int]):
-    if not 1 <= len(control_indices) <= 2:
-        raise ValueError(f"MiniMax-H3 one-frame control indices must have 1 or 2 entries, got {len(control_indices)}")
+    if len(control_indices) < 1:
+        raise ValueError("MiniMax-H3 one-frame control indices must have at least one entry")
     if any(index < 0 for index in control_indices):
         raise ValueError(f"MiniMax-H3 one-frame control indices must be nonnegative, got {control_indices}")
     sd[ONE_FRAME_CONTROL_INDICES_KEY] = torch.tensor(list(control_indices), dtype=torch.int64)
@@ -562,7 +562,7 @@ def save_latent_cache_minimax_h3(
 
     target_pattern = re.compile(r"^latents_(\d+)x(\d+)x(\d+)_(.+)$")
     audio_pattern = re.compile(r"^latents_audio_32x2x(\d+)_(.+)$")
-    visual_condition_pattern = re.compile(r"^latents_(?:first|last|ref_\d{3}_(?:image|video))_(\d+)x(\d+)x(\d+)_(.+)$")
+    visual_condition_pattern = re.compile(r"^latents_(?:first|last|cond_\d{3}|ref_\d{3}_(?:image|video))_(\d+)x(\d+)x(\d+)_(.+)$")
     audio_condition_pattern = re.compile(r"^latents_ref_\d{3}_audio_32x2x(\d+)_(.+)$")
 
     target_count = 0
@@ -580,10 +580,8 @@ def save_latent_cache_minimax_h3(
             normalized[key] = tensor.detach().cpu().contiguous()
             continue
         if key == ONE_FRAME_CONTROL_INDICES_KEY:
-            if tensor.ndim != 1 or not 1 <= tensor.shape[0] <= 2 or tensor.dtype != torch.int64 or bool((tensor < 0).any()):
-                raise ValueError(
-                    f"MiniMax-H3 {ONE_FRAME_CONTROL_INDICES_KEY} must be a nonnegative int64 [K] tensor with K in 1..2"
-                )
+            if tensor.ndim != 1 or tensor.shape[0] < 1 or tensor.dtype != torch.int64 or bool((tensor < 0).any()):
+                raise ValueError(f"MiniMax-H3 {ONE_FRAME_CONTROL_INDICES_KEY} must be a nonnegative int64 [K] tensor with K >= 1")
             normalized[key] = tensor.detach().cpu().contiguous()
             continue
 
@@ -631,41 +629,46 @@ def save_latent_cache_minimax_h3(
     save_latent_cache_common(item_info, normalized, ARCHITECTURE_MINIMAX_H3_FULL, metadata)
 
 
+# (teacher kind, key prefix) of the teacher text rows a MiniMax-H3 text cache may carry next to
+# the student rows; the writer accepts at most one kind per cache
+MINIMAX_H3_TEACHER_TEXT_PREFIXES = (
+    ("first,last", "varlen_mmh3_teacher"),
+    ("ref", "varlen_mmh3_teacher_ref"),
+    ("subject_ref", "varlen_mmh3_teacher_subject_ref"),
+)
+
+
 def save_text_encoder_output_cache_minimax_h3(
     item_info: ItemInfo,
     tensors: dict[str, torch.Tensor],
     metadata: Optional[dict[str, str]] = None,
 ):
     # the teacher prefixes must be split off before matching the student prefix, because
-    # "varlen_mmh3_teacher[_ref]_hidden_states_*" does not share the student prefix; the two
-    # teacher kinds (FL2VA "first,last" vs Ref2VA "ref") use distinct keys so the trainer can
-    # hard-fail on a cache/flag mode mismatch instead of silently misreading the rows
+    # "varlen_mmh3_teacher[_<kind>]_hidden_states_*" does not share the student prefix; each
+    # teacher kind (FL2VA "first,last", Ref2VA "ref", subject-reference "subject_ref") uses
+    # distinct keys so the trainer can hard-fail on a cache/flag mode mismatch instead of
+    # silently misreading the rows. A cache carries the student rows plus at most one kind.
     student_hidden_keys = [key for key in tensors if key.startswith("varlen_mmh3_hidden_states_")]
-    teacher_hidden_keys = [key for key in tensors if key.startswith("varlen_mmh3_teacher_hidden_states_")]
-    teacher_ref_hidden_keys = [key for key in tensors if key.startswith("varlen_mmh3_teacher_ref_hidden_states_")]
     if len(student_hidden_keys) != 1:
         raise ValueError(f"MiniMax-H3 text cache requires exactly one hidden-state tensor, found {len(student_hidden_keys)}")
     tags_key = "varlen_mmh3_token_tags_int64"
-    teacher_tags_key = "varlen_mmh3_teacher_token_tags_int64"
-    teacher_ref_tags_key = "varlen_mmh3_teacher_ref_token_tags_int64"
-
-    has_fl_teacher = bool(teacher_hidden_keys) or teacher_tags_key in tensors
-    has_ref_teacher = bool(teacher_ref_hidden_keys) or teacher_ref_tags_key in tensors
-    if has_fl_teacher and has_ref_teacher:
-        raise ValueError("MiniMax-H3 text cache cannot mix first,last and ref teacher rows")
 
     pairs = [(student_hidden_keys[0], "varlen_mmh3_hidden_states_", tags_key)]
     expected_keys = {student_hidden_keys[0], tags_key}
-    if has_fl_teacher:
-        if len(teacher_hidden_keys) != 1 or teacher_tags_key not in tensors:
+    teacher_kinds_present = []
+    for kind, prefix in MINIMAX_H3_TEACHER_TEXT_PREFIXES:
+        hidden_prefix = f"{prefix}_hidden_states_"
+        kind_tags_key = f"{prefix}_token_tags_int64"
+        hidden_keys = [key for key in tensors if key.startswith(hidden_prefix)]
+        if not hidden_keys and kind_tags_key not in tensors:
+            continue
+        if len(hidden_keys) != 1 or kind_tags_key not in tensors:
             raise ValueError("MiniMax-H3 teacher text rows require exactly one hidden-state tensor and its token tags")
-        pairs.append((teacher_hidden_keys[0], "varlen_mmh3_teacher_hidden_states_", teacher_tags_key))
-        expected_keys |= {teacher_hidden_keys[0], teacher_tags_key}
-    if has_ref_teacher:
-        if len(teacher_ref_hidden_keys) != 1 or teacher_ref_tags_key not in tensors:
-            raise ValueError("MiniMax-H3 teacher text rows require exactly one hidden-state tensor and its token tags")
-        pairs.append((teacher_ref_hidden_keys[0], "varlen_mmh3_teacher_ref_hidden_states_", teacher_ref_tags_key))
-        expected_keys |= {teacher_ref_hidden_keys[0], teacher_ref_tags_key}
+        teacher_kinds_present.append(kind)
+        pairs.append((hidden_keys[0], hidden_prefix, kind_tags_key))
+        expected_keys |= {hidden_keys[0], kind_tags_key}
+    if len(teacher_kinds_present) > 1:
+        raise ValueError(f"MiniMax-H3 text cache cannot mix {' and '.join(teacher_kinds_present)} teacher rows")
     if set(tensors) != expected_keys:
         raise ValueError(f"MiniMax-H3 text cache requires exactly the keys {sorted(expected_keys)}")
 

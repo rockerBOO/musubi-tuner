@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
+import re
 from typing import Any
 
 import numpy as np
@@ -32,7 +33,7 @@ import torch
 import torch.nn as nn
 
 from musubi_tuner.minimax_h3.checkpoint import resolve_safetensors_files
-from musubi_tuner.minimax_h3.media import H3Record, H3Task
+from musubi_tuner.minimax_h3.media import TEXT_VISUAL_FPS, H3Record, H3Task
 from musubi_tuner.modules.nvfp4_utils import NVFP4_STREAM_QUANT_BUFFER_NAMES as _TE_STREAM_QUANT_BUFFER_NAMES
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,9 @@ def _require_visual(visuals: Mapping[object, H3TextVisual], key: object, label: 
         raise ValueError(f"MiniMax-H3 presentation is missing {label} visual data") from error
 
 
+_ONE_FRAME_CONDITION_KEY = re.compile(r"^cond_\d{3}$")
+
+
 def build_presentation(
     record: H3Record,
     task: H3Task,
@@ -104,8 +108,17 @@ def build_presentation(
     if task == "fl2va":
         # the released builder numbers <Picture i> over the pictures that are present,
         # in packed (first, last) order: a lone last frame is still <Picture 1>, and the
-        # first/last distinction is carried only by the rotary anchor times
+        # first/last distinction is carried only by the rotary anchor times. One-frame
+        # layouts use the ordered cond_{i} slots instead, numbered in slot order.
         present_keys = [key for key in ("first", "last") if key in visuals]
+        cond_keys = sorted(key for key in visuals if isinstance(key, str) and _ONE_FRAME_CONDITION_KEY.fullmatch(key))
+        if present_keys and cond_keys:
+            raise ValueError("MiniMax-H3 FL2VA presentation cannot mix first/last visuals with one-frame cond_ visuals")
+        if cond_keys:
+            expected = [f"cond_{index:03d}" for index in range(len(cond_keys))]
+            if cond_keys != expected:
+                raise ValueError(f"MiniMax-H3 one-frame FL2VA visuals must be the contiguous {expected}, got {cond_keys}")
+            present_keys = cond_keys
         if not present_keys:
             raise ValueError("MiniMax-H3 FL2VA presentation requires at least one of the first and last visuals")
         for index, key in enumerate(present_keys, start=1):
@@ -159,7 +172,9 @@ def build_presentation(
 
         visual = _require_visual(visuals, reference.path, f"reference video {reference.path}")
         frames = visual.frames
-        timestamps = list(visual.timestamps) if visual.timestamps is not None else [index / 2.0 for index in range(len(frames))]
+        timestamps = (
+            list(visual.timestamps) if visual.timestamps is not None else [index / TEXT_VISUAL_FPS for index in range(len(frames))]
+        )
         if len(frames) % 2:
             frames = torch.cat((frames, frames[-1:]), dim=0)
             timestamps.append(timestamps[-1])
@@ -443,8 +458,8 @@ def encode_h3_presentation(processor, model, presentation: H3Presentation) -> tu
         processor_args["video_metadata"] = [
             {
                 "total_num_frames": int(video.shape[0]),
-                "fps": 2.0,
-                "duration": float(video.shape[0]) / 2.0,
+                "fps": float(TEXT_VISUAL_FPS),
+                "duration": float(video.shape[0]) / TEXT_VISUAL_FPS,
                 "frames_indices": list(range(video.shape[0])),
                 "height": int(video.shape[1]),
                 "width": int(video.shape[2]),
@@ -567,6 +582,7 @@ TEXT_CACHE_FORMAT = "minimax-h3-text-v2"
 # interfaces.
 TEACHER_CONDITIONS_FIRST_LAST = "first,last"
 TEACHER_CONDITIONS_REF = "ref"
+TEACHER_CONDITIONS_SUBJECT_REF = "subject_ref"
 
 
 def normalize_teacher_conditions(value: str) -> str:
@@ -575,9 +591,49 @@ def normalize_teacher_conditions(value: str) -> str:
         return TEACHER_CONDITIONS_FIRST_LAST
     if parts == [TEACHER_CONDITIONS_REF]:
         return TEACHER_CONDITIONS_REF
+    if parts == [TEACHER_CONDITIONS_SUBJECT_REF]:
+        return TEACHER_CONDITIONS_SUBJECT_REF
     raise ValueError(
         f"MiniMax-H3 teacher matching supports only teacher conditions "
-        f"'{TEACHER_CONDITIONS_FIRST_LAST}' or '{TEACHER_CONDITIONS_REF}', got {value!r}"
+        f"'{TEACHER_CONDITIONS_FIRST_LAST}', '{TEACHER_CONDITIONS_REF}' or '{TEACHER_CONDITIONS_SUBJECT_REF}', got {value!r}"
+    )
+
+
+# The subject-reference teacher caption wrap: the official full-reference declaration blocks
+# that make the base read each picture as a *subject* (identity/appearance) reference rather
+# than a frame of the target. Modeled on the presentation that extracted a character's
+# identity on the released FL2VA weights (probe A, 2026-09-02) with the appearance clauses
+# removed, so it is content-independent boilerplate around the user caption like the
+# ref-teacher wrap; `attribute_transfer` is the empirically validated marker and the
+# "pose, framing, outfit and setting follow the description" clause is what keeps the
+# picture from acting as a copy source.
+SUBJECT_REF_SUMMARY_IMAGE = "The target is a single still image with no motion, a static shot of {subjects} as described below."
+SUBJECT_REF_SUMMARY_VIDEO = "The target video shows {subjects} as described below."
+
+
+def wrap_subject_reference_caption(caption: str, image_count: int, *, still_image: bool) -> str:
+    if image_count < 1:
+        raise ValueError("MiniMax-H3 subject-reference caption requires at least one picture")
+    labels = [f"<Subject {index}>" for index in range(1, image_count + 1)]
+    if len(labels) == 1:
+        subjects = labels[0]
+    else:
+        subjects = ", ".join(labels[:-1]) + f" and {labels[-1]}"
+    definitions = "\n".join(
+        f"<Subject {index}> is the subject whose appearance comes from <Picture {index}> (face and hair style)."
+        for index in range(1, image_count + 1)
+    )
+    summary = (SUBJECT_REF_SUMMARY_IMAGE if still_image else SUBJECT_REF_SUMMARY_VIDEO).format(subjects=subjects)
+    retention = "\n".join(
+        f"<Subject {index}> (appears in [Shot 1]): attribute_transfer - the appearance of <Subject {index}> in"
+        f" <Picture {index}> is referenced; pose, framing, outfit and setting follow the description."
+        for index in range(1, image_count + 1)
+    )
+    return (
+        f"subject_definitions:\n{definitions}\n\n"
+        f"summary:\n[reference generation] {summary}\n\n"
+        f"retention_analysis:\n{retention}\n\n"
+        f"detailed_description:\n{caption}"
     )
 
 
