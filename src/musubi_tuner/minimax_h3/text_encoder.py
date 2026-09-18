@@ -25,7 +25,6 @@ import hashlib
 import json
 import logging
 from pathlib import Path
-import re
 from typing import Any
 
 import numpy as np
@@ -34,6 +33,7 @@ import torch.nn as nn
 
 from musubi_tuner.minimax_h3.checkpoint import resolve_safetensors_files
 from musubi_tuner.minimax_h3.media import TEXT_VISUAL_FPS, H3Record, H3Task
+from musubi_tuner.minimax_h3.packing import FL_CONDITION_ROLES, one_frame_condition_roles, parse_condition_role
 from musubi_tuner.modules.nvfp4_utils import NVFP4_STREAM_QUANT_BUFFER_NAMES as _TE_STREAM_QUANT_BUFFER_NAMES
 
 logger = logging.getLogger(__name__)
@@ -85,7 +85,31 @@ def _require_visual(visuals: Mapping[object, H3TextVisual], key: object, label: 
         raise ValueError(f"MiniMax-H3 presentation is missing {label} visual data") from error
 
 
-_ONE_FRAME_CONDITION_KEY = re.compile(r"^cond_\d{3}$")
+def _fl_visual_keys(visuals: Mapping[object, H3TextVisual]) -> list[str]:
+    """The FL2VA visual keys present, in <Picture i> order: the released first/last anchors or
+    the contiguous one-frame cond_{i} slots (the same role vocabulary as the latent cache)."""
+    present_keys = [key for key in FL_CONDITION_ROLES if key in visuals]
+    cond_keys = sorted(key for key in visuals if isinstance(key, str) and _is_one_frame_condition_role(key))
+    if present_keys and cond_keys:
+        raise ValueError("MiniMax-H3 FL2VA presentation cannot mix first/last visuals with one-frame cond_ visuals")
+    if cond_keys:
+        expected = list(one_frame_condition_roles(len(cond_keys)))
+        if cond_keys != expected:
+            raise ValueError(f"MiniMax-H3 one-frame FL2VA visuals must be the contiguous {expected}, got {cond_keys}")
+        present_keys = cond_keys
+    if not present_keys:
+        raise ValueError(
+            "MiniMax-H3 FL2VA presentation requires the first/last visuals (video targets)"
+            " or the cond_{i} control visuals (one-frame targets)"
+        )
+    return present_keys
+
+
+def _is_one_frame_condition_role(key: str) -> bool:
+    try:
+        return parse_condition_role(key).family == "one_frame"
+    except ValueError:
+        return False
 
 
 def build_presentation(
@@ -110,18 +134,7 @@ def build_presentation(
         # in packed (first, last) order: a lone last frame is still <Picture 1>, and the
         # first/last distinction is carried only by the rotary anchor times. One-frame
         # layouts use the ordered cond_{i} slots instead, numbered in slot order.
-        present_keys = [key for key in ("first", "last") if key in visuals]
-        cond_keys = sorted(key for key in visuals if isinstance(key, str) and _ONE_FRAME_CONDITION_KEY.fullmatch(key))
-        if present_keys and cond_keys:
-            raise ValueError("MiniMax-H3 FL2VA presentation cannot mix first/last visuals with one-frame cond_ visuals")
-        if cond_keys:
-            expected = [f"cond_{index:03d}" for index in range(len(cond_keys))]
-            if cond_keys != expected:
-                raise ValueError(f"MiniMax-H3 one-frame FL2VA visuals must be the contiguous {expected}, got {cond_keys}")
-            present_keys = cond_keys
-        if not present_keys:
-            raise ValueError("MiniMax-H3 FL2VA presentation requires at least one of the first and last visuals")
-        for index, key in enumerate(present_keys, start=1):
+        for index, key in enumerate(_fl_visual_keys(visuals), start=1):
             visual = visuals[key]
             if visual.frames.shape[0] != 1:
                 raise ValueError(f"MiniMax-H3 FL2VA {key} visual must contain exactly one frame")
@@ -272,7 +285,7 @@ def load_h3_text_encoder(
     *,
     device: str | torch.device,
     dtype: torch.dtype = torch.bfloat16,
-    disable_mmap: bool = False,
+    disable_numpy_memmap: bool = False,
     nvfp4_scaled_mm: bool = False,
     blocks_to_swap: int = 0,
     attn_mode: str | None = None,
@@ -329,13 +342,13 @@ def load_h3_text_encoder(
             fp8_optimization=False,
             calc_device=device,
             move_to_device=not streaming,
-            disable_numpy_memmap=disable_mmap,
+            disable_numpy_memmap=disable_numpy_memmap,
             quantizer=quantizer,
         )
         return {normalize_h3_text_encoder_key(key): value for key, value in sd.items()}
 
     files = resolve_safetensors_files(checkpoint_path)
-    formats = detect_comfy_quant_formats(files, disable_numpy_memmap=disable_mmap)
+    formats = detect_comfy_quant_formats(files, disable_numpy_memmap=disable_numpy_memmap)
     if formats == {FORMAT_CONVROT_INT8}:
         # pre-quantized ConvRot INT8 artifact; an empty target list disables dynamic quantization
         quantizer = ConvRotInt8Quantizer(target_layer_keys=[])
@@ -365,7 +378,7 @@ def load_h3_text_encoder(
     else:
         sd = {}
         for file in files:
-            shard = load_safetensors(str(file), device=load_device, disable_mmap=True, disable_numpy_memmap=disable_mmap)
+            shard = load_safetensors(str(file), device=load_device, disable_mmap=True, disable_numpy_memmap=disable_numpy_memmap)
             sd.update({normalize_h3_text_encoder_key(key): value for key, value in shard.items()})
 
     # quantization scale tensors keep their own dtypes (fp32 row scales, fp8 block scales)
@@ -583,6 +596,16 @@ TEXT_CACHE_FORMAT = "minimax-h3-text-v2"
 TEACHER_CONDITIONS_FIRST_LAST = "first,last"
 TEACHER_CONDITIONS_REF = "ref"
 TEACHER_CONDITIONS_SUBJECT_REF = "subject_ref"
+
+# key stem of the teacher text rows a text cache may carry next to the student rows, per teacher
+# kind: each kind uses distinct keys so the trainer hard-fails on a cache/flag mode mismatch
+# instead of silently misreading the rows (the cache writer appends `_hidden_states_<dtype>` /
+# `_token_tags_int64`; the training collator drops the `varlen_` marker and the dtype suffix)
+TEACHER_TEXT_CACHE_PREFIXES = {
+    TEACHER_CONDITIONS_FIRST_LAST: "varlen_mmh3_teacher",
+    TEACHER_CONDITIONS_REF: "varlen_mmh3_teacher_ref",
+    TEACHER_CONDITIONS_SUBJECT_REF: "varlen_mmh3_teacher_subject_ref",
+}
 
 
 def normalize_teacher_conditions(value: str) -> str:

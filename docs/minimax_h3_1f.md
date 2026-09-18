@@ -1,13 +1,13 @@
 # MiniMax-H3 One-Frame (Image) Generation
 
 > [!WARNING]
-> This mode is **experimental**. The released MiniMax-H3 checkpoints were trained on 5-15 second videos; one-frame generation drives them with a single-token target (`T_lat=1`), which is outside the release distribution but works well in practice: plain one-frame T2VA produces high-quality photographic and illustrated images with the FL2VA base, and Ref2VA with a single image reference generates novel views of the referenced subject. See `docs/minimax_h3.md` for the shared setup (models, quantization, block swap, text-encoder streaming).
+> This mode is **experimental**. The released MiniMax-H3 checkpoints were trained on 5-15 second videos; one-frame generation drives them with a single-token target (`T_lat=1`), which is outside the release distribution but works well in practice: plain one-frame T2VA produces high-quality photographic and illustrated images with the FL2VA base, and Ref2VA with a single image reference generates novel views of the referenced subject. See `docs/minimax_h3.md` for the shared setup (models, training recipes, memory options) and `docs/minimax_h3_advanced.md` for the internals.
 
 ## Overview
 
-`--frame_count 1` switches `minimax_h3_generate_video.py` into one-frame mode:
+`--video_length 1` switches `minimax_h3_generate_video.py` into one-frame mode:
 
-- The target is one video latent token plus the two audio latent frames the joint layout requires. The audio is a byproduct and is never decoded; the output is a PNG (`--output` must use `.png`).
+- The target is one video latent token plus the two audio latent frames the joint layout requires. The audio is a byproduct and is never decoded; the output is a PNG (`--save_path` must use `.png`).
 - The single-token VAE decode duplicates the latent to a pseudo two-token clip and keeps pixel frame 0 (a solo token decode breaks down; the duplication decodes within ~1-2 dB of a true two-token decode). This happens inside the VAE automatically.
 - All tasks are available: `t2va` (plain image), `fl2va` with one or more condition images (editing/inbetween-style probes; one or two is the released API, three or more is experimental), and `ref2va` (reference-driven images, including single-image novel-view generation).
 - `--trajectory_dir` writes per-step PNGs instead of per-step videos.
@@ -16,11 +16,13 @@
 
 Training on one-frame targets is available for plain image LoRA (T2VA), for editing/inbetween LoRA with time-annotated control images (FL2VA), and for reference-conditioned image LoRA (Ref2VA); see [One-frame training](#one-frame-training-t2va-image-lora), [One-frame editing training](#one-frame-editing-training-fl2va-control-images), and [One-frame reference training](#one-frame-reference-training-ref2va-image-references) below.
 
-## Time semantics: `--one_frame`
+## Time semantics: `--one_frame_inference`
 
 ```text
---one_frame "target_index=N,control_index=A;B"
+--one_frame_inference "target_index=N,control_index=A;B"
 ```
+
+(`--of` in prompt lines, for both the generation CLI's `--from_file`/`--interactive` modes and training-time samples. The cache scripts and the trainer have a `--one_frame` flag of their own that enables one-frame *training*; the generation option is named like the other architectures' `--one_frame_inference` to keep the two apart.)
 
 Positions on H3's rotary time axis are expressed as **0-based 24 fps pixel-frame indices** on a nominal timeline (one pixel frame = 5/3 rotary units = 1/24 s). All times are relative to the target-block cursor, which itself moves with the text length — only relative placement carries meaning.
 
@@ -40,11 +42,11 @@ python minimax_h3_generate_video.py \
   --audio_vae /models/minimax_h3_audio_vae_fp32.safetensors \
   --text_encoder /models/qwen3vl_32b_minimax_h3_bf16.safetensors \
   --prompt "A watercolor lighthouse at dusk." \
-  --width 1024 --height 1024 \
-  --frame_count 1 \
-  --steps 30 --seed 42 \
+  --video_size 1024 1024 \
+  --video_length 1 \
+  --infer_steps 30 --seed 42 \
   --blocks_to_swap 48 \
-  --output output.png
+  --save_path output.png
 ```
 
 ## Conditioned images (FL2VA, one or more pictures)
@@ -55,16 +57,16 @@ One or two pictures is officially in-distribution for the FL2VA checkpoint (its 
 
 ```bash
 # generate "frame 24" of a nominal clip anchored by one condition image at frame 0
-... --task fl2va --frame_count 1 \
+... --task fl2va --video_length 1 \
   --first_frame anchor.png \
-  --one_frame "target_index=24,control_index=0" \
-  --prompt "..." --output frame24.png
+  --one_frame_inference "target_index=24,control_index=0" \
+  --prompt "..." --save_path frame24.png
 
 # three anchors: frames 0, 48 and 96, generating frame 24 (experimental)
-... --task fl2va --frame_count 1 \
+... --task fl2va --video_length 1 \
   --condition_image a.png --condition_image b.png --condition_image c.png \
-  --one_frame "target_index=24,control_index=0;48;96" \
-  --prompt "..." --output frame24.png
+  --one_frame_inference "target_index=24,control_index=0;48;96" \
+  --prompt "..." --save_path frame24.png
 ```
 
 For best results the caption should follow the official alignment-line formats from the prompt-writing guide (I2VA/L2VA/FL2VA opening lines); the base model reads condition times far more continuously with official-format captions than with plain ones.
@@ -75,9 +77,9 @@ Ref2VA one-frame combines with inline `--ref` references (see `docs/minimax_h3.m
 
 ```bash
 ... --task ref2va --dit /models/minimax_h3_ref2va_bf16.safetensors \
-  --frame_count 1 \
+  --video_length 1 \
   --ref character.png \
-  --prompt "..." --output view.png
+  --prompt "..." --save_path view.png
 ```
 
 With a full-reference-style caption, a single image reference yields novel views of the referenced subject (front/side/back selectable by text) with the environment plausibly extended — useful for synthesizing character-LoRA training data. Note that for dense 2D illustrations the reference is re-drawn rather than preserved pixel-exactly, and unseen-angle environments are plausible inventions, not geometry.
@@ -93,7 +95,7 @@ Audio-bearing video references are accepted and keep their own duration; combini
 
 ### Dataset configuration
 
-Image datasets use the standard image keys. `fp_1f_target_index` (optional, default 0) places the target on the rotary time axis, in the same 0-based 24 fps pixel-frame indices as generation's `--one_frame target_index=N`; for plain image LoRA the default is fine. Control images and `fp_1f_clean_indices` belong to the FL2VA editing mode (next section); `multiple_target` is not supported.
+Image datasets use the standard image keys. `fp_1f_target_index` (optional, default 0) places the target on the rotary time axis, in the same 0-based 24 fps pixel-frame indices as generation's `--one_frame_inference target_index=N`; for plain image LoRA the default is fine. Control images and `fp_1f_clean_indices` belong to the FL2VA editing mode (next section); `multiple_target` is not supported.
 
 ```toml
 [general]
@@ -143,11 +145,11 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 minimax
   ... # remaining flags as in docs/minimax_h3.md
 ```
 
-- **The guidance loss is effectively mandatory for one-frame training.** Without it, de-distillation drift surfaces within ~50 steps as structural degradation — wobbly lines and broken proportions, like low-CFG output of an undistilled model — rather than the washout seen in video training (image steps average over far fewer target rows and repeat a small dataset quickly). `--h3_guidance_loss_scale 4.0 --h3_guidance_loss_sigma_min 0.15` with an uncond cache (see `docs/minimax_h3.md`) restored clean structure in testing; a short LR warmup (e.g. 50 steps) also helps the early phase.
+- **One of the three loss methods of `docs/minimax_h3.md` is mandatory for one-frame training.** With the plain flow target alone, de-distillation drift surfaces within ~50 steps as structural degradation — wobbly lines and broken proportions, like low-CFG output of an undistilled model — rather than the washout seen in video training (image steps average over far fewer target rows and repeat a small dataset quickly). A training adapter (`--base_weights`) or the guidance loss (`--h3_guidance_loss_scale 4.0 --h3_guidance_loss_sigma_min 0.15` with an uncond cache) restores clean structure; a short LR warmup (e.g. 50 steps) also helps the early phase. For character identity LoRAs with per-item references there is a third option, the subject-reference teacher (see [One-frame reference training](#one-frame-reference-training-ref2va-image-references)). Editing and reference training below take the adapter or the guidance loss.
 - `--video_only` is recommended for image-only runs: the silence placeholders are excluded from audio supervision by presence gating either way, so the audio loss would always be 0.
 - Steps are much cheaper than video steps (a 1 MP image is a few hundred target rows); with block swap active, per-step time is dominated by weight streaming rather than compute.
 - Mixed image+video training in one run is expected to work (`--one_frame` only adds acceptance of one-frame batches; video batches are unaffected) but is untested — treat it as experimental.
-- `--h3_teacher_matching` is not supported with `--one_frame` yet.
+- Training-time samples under a merged `--base_weights` adapter show the de-distilled model and are not representative; evaluate with the generation CLI on the plain base + LoRA.
 
 Training-time samples support one-frame outputs: `--f 1` in a sample prompt line switches that sample to a PNG (audio is never decoded), and `--of target_index=N` optionally places it on the time axis:
 
@@ -184,7 +186,7 @@ fp_1f_target_index = 24       # target position — REQUIRED when controls are p
 
 ### Choosing indices
 
-The base model's strongest prior is **verbatim anchor copying at coinciding timestamps**: a control whose index equals the target index is reproduced almost exactly, so such a dataset trains head-on against copying — only do this when copy-at-the-anchor is the desired behavior. The recommended starting recipe for editing is `fp_1f_clean_indices = [0]`, `fp_1f_target_index = 24` (a one-second separation); inference must then use the same relative placement (`--one_frame "target_index=24,control_index=0"`). For inbetween triplets extracted from real videos, use the real frame distances: (first@0, last@N, target@αN) → `fp_1f_clean_indices = [0, N]`, `fp_1f_target_index = round(αN)`. Since the indices live in the dataset config, one α per dataset block; several blocks can share a TOML.
+The base model's strongest prior is **verbatim anchor copying at coinciding timestamps**: a control whose index equals the target index is reproduced almost exactly, so such a dataset trains head-on against copying — only do this when copy-at-the-anchor is the desired behavior. The recommended starting recipe for editing is `fp_1f_clean_indices = [0]`, `fp_1f_target_index = 24` (a one-second separation); inference must then use the same relative placement (`--one_frame_inference "target_index=24,control_index=0"`). For inbetween triplets extracted from real videos, use the real frame distances: (first@0, last@N, target@αN) → `fp_1f_clean_indices = [0, N]`, `fp_1f_target_index = round(αN)`. Since the indices live in the dataset config, one α per dataset block; several blocks can share a TOML.
 
 **Captions must follow the official alignment-line formats** (I2VA/L2VA/FL2VA opening lines from the prompt-writing guide): plain captions actively suppress the base model's continuous reading of condition times, which is exactly the pathway this training relies on.
 
@@ -192,7 +194,7 @@ The base model's strongest prior is **verbatim anchor copying at coinciding time
 
 Same commands as plain image training with `--task fl2va` instead of `--task t2va` on both cache scripts and the trainer. The latent cache additionally holds the condition latents (`latents_cond_000`, `latents_cond_001`, ... in control order) and the control indices as a tensor entry; the text cache embeds the bucket-resized control images in the FL2VA presentation. Changing `fp_1f_target_index` or `fp_1f_clean_indices` re-caches latents only (`--skip_existing` detects it); changing control image files re-caches both. One-frame FL2VA latent caches written before the ordered `cond_` slots (they used `latents_first`/`latents_last`) are rebuilt automatically by `--skip_existing`, and the trainer rejects them with a re-cache hint if they are used as-is.
 
-The guidance-loss recommendation from plain image training applies unchanged. Training-time samples mirror the generation CLI: provide the condition image(s) and the placement per prompt line:
+The loss-method requirement from plain image training applies unchanged: a training adapter or the guidance loss (teacher matching does not apply, since its student is always `--task t2va`). Training-time samples mirror the generation CLI: provide the condition image(s) and the placement per prompt line:
 
 ```text
 Official-format caption... --w 1024 --h 1024 --f 1 --s 30 --i source.png --of target_index=24,control_index=0
@@ -255,7 +257,7 @@ python minimax_h3_cache_text_encoder_outputs.py --dataset_config items.toml --ta
 accelerate launch ... minimax_h3_train_network.py --dataset_config items.toml --task ref2va --one_frame --video_only ...
 ```
 
-The guidance-loss recommendation from plain image training applies unchanged (the uncond probe keeps the reference conditions and swaps only the text rows). The same `--task ref2va` latent caches also feed the subject-reference teacher for a text-only student (`--task t2va --h3_teacher_matching --h3_teacher_conditions subject_ref`, the only teacher-matching mode available with `--one_frame`; see the teacher-matching section of `docs/minimax_h3.md`). Training-time samples use the inline `--ref` syntax with `--f 1`:
+The loss-method requirement from plain image training applies unchanged: a training adapter or the guidance loss (the uncond probe keeps the reference conditions and swaps only the text rows). The same `--task ref2va` latent caches also feed the **subject-reference teacher** for a text-only student — the recipe for a character LoRA that is used without references at inference (`--task t2va --one_frame --h3_teacher_matching --h3_teacher_conditions subject_ref`, the only teacher-matching mode available with `--one_frame`; the text cache is then written with `--task t2va --one_frame --teacher_conditions subject_ref`). It needs no adapter and no guidance loss: the teacher's prediction carries the base's own guidance amplification. The recipe is in the Training section of `docs/minimax_h3.md`; the mechanism and the data contract (`teacher_caption`, the `<Subject 1>` trigger) are in `docs/minimax_h3_advanced.md`. Training-time samples use the inline `--ref` syntax with `--f 1`:
 
 ```text
 Full-reference caption... --w 1024 --h 1024 --f 1 --s 30 --ref refs/front.png --of target_index=0
