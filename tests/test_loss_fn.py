@@ -371,6 +371,8 @@ def test_validate_args_resolves_loss_fn_at_startup():
         cuda_cudnn_benchmark=False,
         dataset_config="dummy.toml",
         dit="dummy.safetensors",
+        output_dir="dummy_out",
+        output_name="dummy",
         fp8_scaled=False,
         fp8_base=False,
         sage_attn=False,

@@ -107,6 +107,10 @@ class LoRAModule(torch.nn.Module):
         # frozen base everywhere (e.g. the MiniMax-H3 teacher-matching forward)
         self.enabled = True
 
+        # Used by _rank_dropout_mask to locate the rank dim in lx; saved now since
+        # org_module is deleted in apply_to() before forward() ever runs.
+        self._rank_dropout_is_conv = org_module.__class__.__name__ in ("Conv2d", "Conv3d")
+
     def _autocast_enabled_for(self, x):
         if not x.is_floating_point():
             return False
